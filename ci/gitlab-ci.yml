@@ -1,0 +1,14 @@
+# .gitlab-ci.yml (or an included file) - push this site's automation rules to Automation
+# Map from a pipeline schedule (CI/CD -> Schedules, daily). CI/CD variables, masked and
+# protected: ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, AUTOMAP_KEY; plain: ATLASSIAN_SITE, AUTOMAP_URL.
+automap-sync:
+  image:
+    name: ghcr.io/moy-apps/automap-sync:1
+    entrypoint: ['']
+    pull_policy: always
+  script:
+    - python3 -I /app/automap_sync.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+  timeout: 30m

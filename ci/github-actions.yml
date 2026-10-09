@@ -1,0 +1,22 @@
+# .github/workflows/automap-sync.yml - push this site's automation rules to Automation Map
+# once a day. Repository secrets: ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, AUTOMAP_KEY;
+# repository variables: ATLASSIAN_SITE, AUTOMAP_URL.
+name: automap-sync
+on:
+  schedule:
+    - cron: '17 3 * * *'   # daily, 03:17 UTC - pick a quiet minute
+  workflow_dispatch: {}
+permissions: {}            # the job needs no access to this repository
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Push automation rules
+        run: docker run --rm --pull always -e ATLASSIAN_SITE -e ATLASSIAN_EMAIL -e ATLASSIAN_API_TOKEN -e AUTOMAP_URL -e AUTOMAP_KEY ghcr.io/moy-apps/automap-sync:1
+        env:
+          ATLASSIAN_SITE: ${{ vars.ATLASSIAN_SITE }}
+          AUTOMAP_URL: ${{ vars.AUTOMAP_URL }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+          AUTOMAP_KEY: ${{ secrets.AUTOMAP_KEY }}

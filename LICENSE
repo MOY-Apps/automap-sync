@@ -1,0 +1,15 @@
+Automation Map sync senders
+Copyright (c) 2026 MOY Apps. All rights reserved.
+
+The source code in this directory is published so that you can read, review and audit
+it before running it with your own credentials.
+
+You may run these senders, unmodified or modified for your own internal use, only to
+send data from Jira sites you administer to Automation Map for Jira, an app by MOY Apps.
+
+You may not redistribute them, publish modified versions, or use them, or any part of
+them, with any other product or service.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN
+NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM THE USE OF THE SOFTWARE.

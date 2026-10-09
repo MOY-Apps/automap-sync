@@ -1,0 +1,30 @@
+# A daily CronJob. Create the secret first:
+#   kubectl create secret generic automap-sync --from-literal=ATLASSIAN_EMAIL=... \
+#     --from-literal=ATLASSIAN_API_TOKEN=... --from-literal=AUTOMAP_KEY=... \
+#     --from-literal=ATLASSIAN_SITE=your-site.atlassian.net --from-literal=AUTOMAP_URL=https://.../v1/push
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: automap-sync
+spec:
+  schedule: '17 3 * * *'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext: { runAsNonRoot: true }
+          containers:
+            - name: automap-sync
+              image: ghcr.io/moy-apps/automap-sync:1
+              imagePullPolicy: Always
+              envFrom: [{ secretRef: { name: automap-sync } }]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: [ALL] }
+              resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
