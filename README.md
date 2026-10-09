@@ -48,8 +48,10 @@ The log has counts and status words only — never a token, a key or a rule.
 
 ## Schedule
 
-Once a day is right for almost everyone. Each push that loads counts against the plan's
-loads (Basic 7 in 7 days, Advanced 5 a day); a sender scheduled more often gets exit 5.
+Once a day is right for almost everyone. On the Marketplace app each push that loads
+counts against the plan's loads (Basic 7 in 7 days, Advanced 5 a day); on Automation Map
+Enterprise a new push may start an hour after the last one. A sender scheduled more often
+gets exit 5.
 
 - **GitHub Actions** — [`ci/github-actions.yml`](ci/github-actions.yml)
 - **GitLab CI** — [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml)
