@@ -4,7 +4,7 @@ Automation Map cannot read your automation rules by itself: Atlassian's Automati
 accepts only a personal API token, and a Marketplace app is not allowed to hold one. So a
 small job on **your** side reads the rules with **your** token and pushes them to the app.
 The token never leaves your infrastructure; the app only ever sees a key it issued
-(`amk_…`). The protocol is in [`docs/push-sync.md`](../docs/push-sync.md).
+(`amk_…`). The protocol is in [`PROTOCOL.md`](PROTOCOL.md).
 
 ## Pick one
 
@@ -27,8 +27,8 @@ All of them read the same settings, send the same thing and exit the same way.
 | `ATLASSIAN_SITE` | `your-site.atlassian.net` (or `ATLASSIAN_CLOUD_ID` instead) |
 | `ATLASSIAN_EMAIL` | the account the token belongs to — a Jira administrator; a service account is best |
 | `ATLASSIAN_API_TOKEN` | an API token **with the Automation scope** (id.atlassian.com → Security → API tokens) |
-| `AUTOMAP_URL` | Jira settings → Apps → Automation Map → Data → *Automatic sync from your side* → Receiver |
-| `AUTOMAP_KEY` | the same card → **Make a key** (shown once) |
+| `AUTOMAP_URL` | Jira settings → Apps → Automation Map → Data → *Push from your side* → **Set up**: the guide shows the receiver URL |
+| `AUTOMAP_KEY` | the same guide makes it the moment a tool is picked, and shows it once |
 | `AUTOMAP_CHUNK_BYTES` | optional, default `200000` |
 
 `--dry-run` (PowerShell: `-DryRun`; ScriptRunner: `AUTOMAP_DRY_RUN=1`) reads everything and

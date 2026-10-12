@@ -1,4 +1,4 @@
-# For the public automap-sync repository: .github/workflows/release.yml
+# The public automap-sync repository is a subtree of senders/ in the app repository.
 # On a tag v1.2.3: build the image for amd64 and arm64, push :1.2.3, :1.2 and :1 to GHCR,
 # sign it with cosign (keyless, GitHub OIDC) and attach an SBOM.
 name: release-image
