@@ -16,6 +16,7 @@ The token never leaves your infrastructure; the app only ever sees a key it issu
 | [`bash/automap-sync.sh`](bash/automap-sync.sh) | Linux, macOS | bash 3.2+, curl, jq 1.6+ | a minimal box with no Python |
 | [`powershell/automap-sync.ps1`](powershell/automap-sync.ps1) | Windows, Linux, macOS | PowerShell 7.2+ | a Windows estate, Task Scheduler |
 | [`scriptrunner/AutomapSync.groovy`](scriptrunner/AutomapSync.groovy) | inside Jira | ScriptRunner for Jira Cloud | you already have ScriptRunner and a small site (see its limits) |
+| [`jmwe/automap-sync.njk`](jmwe/automap-sync.njk) | inside Jira | JMWE for Jira Cloud (a Nunjucks template in a Scheduled action) | you already have JMWE and a small site; the token sits in the template, the payload is proven by length |
 
 All of them read the same settings, send the same thing and exit the same way.
 

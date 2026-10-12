@@ -1,0 +1,107 @@
+{#-
+  automap-sync (JMWE for Jira Cloud) - push this site's automation rules to Automation Map.
+
+  A Nunjucks template for JMWE's "Build-your-own (scripted) post-function", run by a
+  Scheduled action whose JQL matches ONE anchor work item (e.g. key = OPS-1), daily - so
+  the template runs once per run. Contract: docs/push-sync.md.
+
+  Fill the five values below. JMWE has no secret store: the token is readable by anyone
+  who can edit JMWE configuration. If the site uses an IP allowlist, add JMWE's egress
+  addresses to it (see the JMWE callRest documentation).
+
+  JMWE's Nunjucks has no SHA-256, so the payload is proven by X-Automap-Length (the text's
+  length in UTF-16 code units). It cannot escape to ASCII either, so it sends UTF-8 and
+  never ends a chunk between the halves of a surrogate pair. Chunks are 80 000 characters:
+  at most 240 KB of UTF-8, under the receiver's 256 KiB.
+
+  Each rule is one request; a site with many hundreds of rules may run longer than a
+  JMWE action is allowed to - use another sender there.
+
+  The rendered output is one line saying what happened; it lands in JMWE's logs.
+
+  Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
+-#}
+{%- set SITE = "your-site.atlassian.net" -%}
+{%- set EMAIL = "you@example.com" -%}
+{%- set TOKEN = "an API token with the Automation scope" -%}
+{%- set PUSH_URL = "the receiver URL from Automation Map, ending /v1/push" -%}
+{%- set KEY = "the amk_ key from Automation Map" -%}
+
+{%- set NAME = "jmwe" -%}
+{%- set VERSION = "1.0.0" -%}
+{%- set CHUNK = 80000 -%}
+{%- set MAX_PAGES = 100 -%}
+{%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
+
+{#- 1. the cloud id, then every rule id, page by page -#}
+{%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
+{%- set API = "https://api.atlassian.com/automation/public/jira/" + tenant.cloudId + "/rest/v1" -%}
+{%- set ids = [] -%}
+{%- set pages = [""] -%}
+{%- for p in range(0, MAX_PAGES) -%}
+  {%- if p < pages.length -%}
+    {#- links.next is a query string ("?cursor=...") on Atlassian's API, a full URL elsewhere -#}
+    {%- set target = pages[p] if (pages[p] and pages[p].indexOf("http") == 0) else (API + "/rule/summary" + (pages[p] if pages[p] else "?limit=100")) -%}
+    {%- set page = target | callRest(options=OPTS) -%}
+    {%- for item in page.data -%}
+      {%- set _ = ids.push(item.uuid if item.uuid else item.id) -%}
+    {%- endfor -%}
+    {%- if page.links and page.links.next -%}
+      {%- set _ = pages.push(page.links.next) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- 2. each rule, wrapped in "rule", as compact JSON -#}
+{%- set parts = [] -%}
+{%- for id in ids -%}
+  {%- set d = (API + "/rule/" + id) | callRest(options=OPTS) -%}
+  {%- set _ = parts.push({ "rule": (d.rule if d.rule else d) } | dump) -%}
+{%- endfor -%}
+{%- set text = '{"rules":[' + parts.join(",") + '],"sender":{"name":"' + NAME + '","version":"' + VERSION + '","rules":' + parts.length + '}}' -%}
+
+{#- 3. chunk boundaries, never between the two halves of a surrogate pair -#}
+{%- set bounds = [0] -%}
+{%- for i in range(0, (text.length // CHUNK) + 2) -%}
+  {%- set start = bounds[bounds.length - 1] -%}
+  {%- if start < text.length -%}
+    {%- set end = (start + CHUNK) if (start + CHUNK) < text.length else text.length -%}
+    {%- set code = text.charCodeAt(end - 1) -%}
+    {%- set end = (end - 1) if (end < text.length and code >= 55296 and code <= 56319) else end -%}
+    {%- set _ = bounds.push(end) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- 4. push: one run id, chunks in order, the length on the last one -#}
+{%- set run = NAME + "-" + text.length + "-" + ids.length + "-" + (now | date("x") if now else "0") -%}
+{%- set failures = [] -%}
+{%- set count = bounds.length - 1 -%}
+{#- JMWE's range() includes its end (checked live: range(0, 8) reached 8), the standard
+    one does not; the guard makes both send exactly `count` chunks -#}
+{%- for i in range(0, count) -%}
+  {%- if failures.length == 0 and i < count -%}
+    {%- set headers = {
+      "Authorization": "Bearer " + KEY,
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Automap-Run": run,
+      "X-Automap-Seq": "" + i,
+      "X-Automap-Sender": NAME + "/" + VERSION
+    } -%}
+    {%- if i == count - 1 -%}
+      {%- set headers = {
+        "Authorization": "Bearer " + KEY,
+        "Content-Type": "text/plain; charset=utf-8",
+        "X-Automap-Run": run,
+        "X-Automap-Seq": "" + i,
+        "X-Automap-Sender": NAME + "/" + VERSION,
+        "X-Automap-Last": "1",
+        "X-Automap-Length": "" + text.length
+      } -%}
+    {%- endif -%}
+    {%- set res = PUSH_URL | callRest(verb="post", body=text.slice(bounds[i], bounds[i + 1]), noJSON=true, dontFail=true, options={ "headers": headers, "timeout": 60000 }) -%}
+    {%- if res._statusCode -%}
+      {%- set _ = failures.push("chunk " + i + ": HTTP " + res._statusCode) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+automap-sync {{ NAME }} {{ VERSION }}: {{ ids.length }} rules, {{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else "pushed, the map is rebuilding" }}

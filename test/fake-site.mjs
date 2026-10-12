@@ -134,8 +134,12 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       const seq = Number(h('x-automap-seq'));
       const last = h('x-automap-last') === '1' || h('x-automap-last') === 'true';
       const sum = String(h('x-automap-sha256') || '').toLowerCase();
+      const lengthText = String(h('x-automap-length') || '');
+      state.requests = state.requests || [];
+      state.requests.push({ run, seq: h('x-automap-seq'), last: h('x-automap-last'), length: lengthText, sha: sum, bytes: raw.length, sender: h('x-automap-sender') });
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(run) || !Number.isInteger(seq) || seq < 0) return answer('bad-request');
-      if (last && !/^[0-9a-f]{64}$/.test(sum)) return answer('bad-request');
+      // like the real receiver: the last chunk proves the payload by SHA-256, by length, or both
+      if (last && !/^[0-9a-f]{64}$/.test(sum) && !/^\d{1,10}$/.test(lengthText)) return answer('bad-request');
       if (String(h('content-encoding') || '').includes('gzip') || !raw.length) return answer('bad-request');
       if (raw.length > 256 * 1024) return answer('too-large');
       if (raw.some((b) => b > 0x7f)) state.nonAscii = true;
@@ -156,7 +160,8 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       if (!last) return answer('accepted');
       if (entry.parts.length !== seq + 1) return answer('conflict');
       const whole = Buffer.concat(entry.parts);
-      if (createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
+      if (sum && createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
+      if (lengthText && whole.toString('utf8').length !== Number(lengthText)) return answer('checksum');
       entry.closed = true;
       state.loaded.push(JSON.parse(whole.toString('utf8')));
       return answer('queued');
