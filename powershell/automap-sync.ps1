@@ -112,11 +112,14 @@ $parts = [System.Collections.Generic.List[string]]::new()
 foreach ($id in $ids) {
   $text = Get-Atlassian ('/rule/' + [Uri]::EscapeDataString($id))
   $doc = [System.Text.Json.JsonDocument]::Parse($text)
-  $inner = $null
-  if ($doc.RootElement.ValueKind -eq 'Object' -and $doc.RootElement.TryGetProperty('rule', [ref]$inner)) {
-    $raw = $inner.GetRawText()
-  } else {
-    $raw = $doc.RootElement.GetRawText()
+  # the rule as the API wrote it: inside "rule" when wrapped, the whole answer when bare.
+  # Properties are walked rather than TryGetProperty'd: PowerShell cannot bind the [ref]
+  # out-parameter of a struct it has not been told the type of.
+  $raw = $doc.RootElement.GetRawText()
+  if ($doc.RootElement.ValueKind -eq 'Object') {
+    foreach ($prop in $doc.RootElement.EnumerateObject()) {
+      if ($prop.Name -eq 'rule') { $raw = $prop.Value.GetRawText(); break }
+    }
   }
   $doc.Dispose()
   $parts.Add('{"rule":' + $raw + '}')

@@ -29,7 +29,7 @@ const SENDERS = [
     run: (e, envv, local) => (local
       ? ['pwsh', ['-NoProfile', '-File', join(root, 'powershell/automap-sync.ps1'), ...e.map((a) => (a === '--dry-run' ? '-DryRun' : a))]]
       : ['docker', ['run', '--rm', '-v', `${root}:/s:ro`, ...dockerEnv(envv), ...PLATFORM,
-        'mcr.microsoft.com/powershell:latest', 'pwsh', '-NoProfile', '-File', '/s/powershell/automap-sync.ps1',
+        'mcr.microsoft.com/dotnet/sdk:8.0', 'pwsh', '-NoProfile', '-File', '/s/powershell/automap-sync.ps1',
         ...e.map((a) => (a === '--dry-run' ? '-DryRun' : a))]]),
   },
   {
