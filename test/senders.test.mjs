@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { startFakeSite, makeRules, expectedRules, KEY } from './fake-site.mjs';
@@ -18,6 +19,18 @@ const has = (cmd, args = ['--version']) => spawnSync(cmd, args, { stdio: 'ignore
 const dockerUp = spawnSync('docker', ['info'], { stdio: 'ignore', timeout: 10_000 }).status === 0
   && spawnSync('docker', ['run', '--rm', 'alpine:3', 'true'], { stdio: 'ignore', timeout: 20_000, killSignal: 'SIGKILL' }).status === 0;
 const PLATFORM = ['--platform', process.arch === 'arm64' ? 'linux/arm64' : 'linux/amd64'];
+
+/** The version a sender announces, read from its own file so a release never has to touch this test. */
+const FILES = {
+  python: 'python/automap_sync.py', node: 'node/automap-sync.mjs', bash: 'bash/automap-sync.sh',
+  powershell: 'powershell/automap-sync.ps1', scriptrunner: 'scriptrunner/AutomapSync.groovy',
+};
+function versionOf(name) {
+  const text = readFileSync(join(root, FILES[name]), 'utf8');
+  const m = text.match(/VERSION\s*=\s*['"]?(\d+\.\d+\.\d+)/i);
+  if (!m) throw new Error(`${name}: no VERSION in ${FILES[name]}`);
+  return m[1];
+}
 
 const SENDERS = [
   { name: 'python', run: (e) => ['python3', [join(root, 'python/automap_sync.py'), ...e]], ok: has('python3') },
@@ -74,7 +87,7 @@ for (const s of SENDERS) {
       assert.equal(site.state.loaded.length, 1, out);
       assert.deepEqual(site.state.loaded[0].rules, expectedRules(rules));
       assert.equal(site.state.loaded[0].sender.name, s.name);
-      assert.deepEqual([...site.state.senders], [`${s.name}/1.0.0`]);
+      assert.deepEqual([...site.state.senders], [`${s.name}/${versionOf(s.name)}`]);
       assert.equal(site.state.nonAscii, false, 'the body must be ASCII so a byte split is safe');
       assert.ok(site.state.answers.filter((a) => a === 'accepted').length >= 2, 'small chunks mean several requests');
       assert.ok(!out.includes(KEY) && !out.includes('atlassian-token-for-tests'), 'no secret in the log');

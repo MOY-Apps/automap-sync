@@ -8,7 +8,8 @@
  *
  * Setup: ScriptRunner -> Settings -> Script Variables, add (mark the secrets as secret):
  *   ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, AUTOMAP_URL, AUTOMAP_KEY
- *   optional ATLASSIAN_CLOUD_ID (else read from ATLASSIAN_SITE), AUTOMAP_CHUNK_BYTES
+ *   optional: ATLASSIAN_SITE (your-site.atlassian.net; without it the script asks the
+ *   site it runs on), ATLASSIAN_CLOUD_ID, AUTOMAP_CHUNK_BYTES, AUTOMAP_DRY_RUN = 1
  * Then ScriptRunner -> Scheduled Jobs -> Create, run as an administrator, once a day,
  * and paste this script.
  *
@@ -24,12 +25,20 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.0.0'
+final String VERSION = '1.0.1'
 final Set<Integer> REFUSED = [400, 401, 402, 403, 404, 405, 413, 426] as Set
 
-// Script Variables arrive as variables of the script; the environment is for local runs.
+// Script Variables arrive as variables of the script (ScriptRunner resolves them by name,
+// not always through binding.hasVariable); the environment is for local runs.
+def lookup = { String k ->
+  def v = null
+  try { v = binding.getVariable(k) } catch (MissingPropertyException ignore) { v = null }
+  if (v == null) { try { v = this."$k" } catch (MissingPropertyException ignore) { v = null } }
+  if (v == null) v = System.getenv(k)
+  v
+}
 def cfg = { String k, String fallback = null ->
-  def v = binding.hasVariable(k) ? binding.getVariable(k) : System.getenv(k)
+  def v = lookup(k)
   v = v ? v.toString() : fallback
   if (!v) throw new IllegalStateException("[2] ${k} is not set")
   v
@@ -39,16 +48,18 @@ def say = { String m ->
   if (binding.hasVariable('logger')) binding.getVariable('logger').info(line) else System.err.println(line)
 }
 
-boolean dryRun = (binding.hasVariable('AUTOMAP_DRY_RUN') ? binding.getVariable('AUTOMAP_DRY_RUN') : System.getenv('AUTOMAP_DRY_RUN')) == '1'
+boolean dryRun = lookup('AUTOMAP_DRY_RUN')?.toString() == '1'
 String auth = 'Basic ' + "${cfg('ATLASSIAN_EMAIL')}:${cfg('ATLASSIAN_API_TOKEN')}".bytes.encodeBase64().toString()
 String api = cfg('ATLASSIAN_API_BASE', 'https://api.atlassian.com').replaceAll('/$', '')
 
-String cloud = binding.hasVariable('ATLASSIAN_CLOUD_ID') ? binding.getVariable('ATLASSIAN_CLOUD_ID') : System.getenv('ATLASSIAN_CLOUD_ID')
+String cloud = lookup('ATLASSIAN_CLOUD_ID')?.toString()
 if (!cloud) {
-  String site = cfg('ATLASSIAN_SITE')
-  if (!site.contains('://')) site = "https://${site}"
-  def r = Unirest.get(site.replaceAll('/$', '') + '/_edge/tenant_info').asString()
-  if (r.status != 200) throw new IllegalStateException("[3] could not read the cloud id of ${site} (HTTP ${r.status})")
+  // ATLASSIAN_SITE names the site; without it, the site this script runs on: inside
+  // ScriptRunner a relative Unirest call goes to the current site
+  String site = lookup('ATLASSIAN_SITE')?.toString()
+  String where = site ? ((site.contains('://') ? site : "https://${site}").replaceAll('/$', '') + '/_edge/tenant_info') : '/_edge/tenant_info'
+  def r = Unirest.get(where).asString()
+  if (r.status != 200) throw new IllegalStateException("[3] could not read the cloud id of ${site ?: 'this site'} (HTTP ${r.status})")
   cloud = new JsonSlurper().parseText(r.body).cloudId
 }
 String base = "${api}/automation/public/jira/${cloud}/rest/v1"
