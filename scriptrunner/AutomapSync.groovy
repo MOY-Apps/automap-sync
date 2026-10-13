@@ -6,12 +6,29 @@
  * Variables, and pushes them to the Automation Map push receiver with the key the app
  * issued. Contract: docs/push-sync.md.
  *
- * Setup: ScriptRunner -> Settings -> Script Variables, add (mark the secrets as secret):
- *   ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, AUTOMAP_URL, AUTOMAP_KEY
- *   optional: ATLASSIAN_SITE (your-site.atlassian.net; without it the script asks the
- *   site it runs on), ATLASSIAN_CLOUD_ID, AUTOMAP_CHUNK_BYTES, AUTOMAP_DRY_RUN = 1
- * Then ScriptRunner -> Scheduled Jobs -> Create, run as an administrator, once a day,
- * and paste this script.
+ * SETUP
+ *
+ * 1. ScriptRunner -> Settings -> Script Variables. Add four variables, one per line below
+ *    (Name = Value). Tick "secret" on the two marked SECRET.
+ *
+ *      ATLASSIAN_EMAIL      = the e-mail of a Jira administrator, best a service account
+ *      ATLASSIAN_API_TOKEN  = that account's API token, made at id.atlassian.com ->
+ *                             Security -> API tokens WITH THE AUTOMATION SCOPE      SECRET
+ *      AUTOMAP_URL          = the receiver address from Automation Map's set-up guide,
+ *                             ending /v1/push
+ *      AUTOMAP_KEY          = the amk_ key from the same guide (shown once)        SECRET
+ *
+ *    Not needed: ATLASSIAN_SITE. The script uses the Jira site it runs in. Set it only to
+ *    read the rules of a different site (your-site.atlassian.net).
+ *
+ * 2. Try it: ScriptRunner -> Script Console. Add one more variable, AUTOMAP_DRY_RUN = 1,
+ *    paste this script, Run. It reads every rule and sends nothing; the log says how many.
+ *    Delete AUTOMAP_DRY_RUN and run again to push.
+ *
+ * 3. Schedule it: ScriptRunner -> Scheduled Jobs -> Create, run as a Jira administrator,
+ *    once a day, and paste this script.
+ *
+ * Rarely needed: ATLASSIAN_CLOUD_ID (skips looking it up), AUTOMAP_CHUNK_BYTES (200000).
  *
  * Limits: a ScriptRunner Cloud script has a time limit per run. Reading a rule takes one
  * request, so a site with more than a few hundred rules may not finish in one run - use

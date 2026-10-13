@@ -24,7 +24,7 @@ All of them read the same settings, send the same thing and exit the same way.
 
 | Variable | |
 |---|---|
-| `ATLASSIAN_SITE` | `your-site.atlassian.net` (or `ATLASSIAN_CLOUD_ID` instead) |
+| `ATLASSIAN_SITE` | `your-site.atlassian.net` (or `ATLASSIAN_CLOUD_ID` instead). Not needed in ScriptRunner: it uses the site it runs in |
 | `ATLASSIAN_EMAIL` | the account the token belongs to — a Jira administrator; a service account is best |
 | `ATLASSIAN_API_TOKEN` | an API token **with the Automation scope** (id.atlassian.com → Security → API tokens) |
 | `AUTOMAP_URL` | Jira settings → Apps → Automation Map → Data → *Push from your side* → **Set up**: the guide shows the receiver URL |
