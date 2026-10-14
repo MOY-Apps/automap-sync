@@ -89,6 +89,24 @@ function usageAnswer(name, url, rules) {
       return { data: [{ month: '2026-09', workspaceCounts: { JIRA_SERVICE_MANAGEMENT: 1073 } }] };
     case 'hasCreditPack':
       return { hasCreditPack: false };
+    case 'auditlog': {
+      // the audit log: two runs of the first rule (one failed), one idle run of the second, an edit
+      const now = Date.now();
+      const items = [
+        { id: 101, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SOME_ERRORS', eventTimestamp: now - 3600000, durationMs: 31000, associatedIds: ['10042'] },
+        { id: 102, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SUCCESS', eventTimestamp: now - 7200000, durationMs: 29000 },
+        { id: 103, ruleIdUuid: b.uuid, ruleName: b.name, category: 'NO_ACTIONS_PERFORMED', eventTimestamp: now - 3600000, durationMs: 120 },
+        { id: 104, ruleIdUuid: b.uuid, ruleName: b.name, category: 'CONFIG_CHANGE', eventTimestamp: now - 3600000 },
+      ];
+      return { items: { items: url.searchParams.get('offset') ? [] : items, total: 0 } };
+    }
+    case 'auditlog/item/101':
+      return { id: 101, content: { componentLogs: [
+        { component: { id: 'c-trigger', componentType: 'TRIGGER', type: 'jira.jql.scheduled' }, changes: [], executionResult: { state: null } },
+        { component: { id: 'c-branch', componentType: 'BRANCH', type: 'jira.smart.values.branch' },
+          changes: [{ payload: { type: 'ERROR', key: 'com.codebarrel.automation.rule.error.smart.value.no.object', appendParameters: ['secret-field-value'] } }],
+          executionResult: { state: 'SOME_ERRORS', displayMessages: ['projectName: secret-project-name'] } },
+      ] } };
     default:
       return null;
   }
@@ -96,7 +114,8 @@ function usageAnswer(name, url, rules) {
 
 export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null, flaky = true, host = '127.0.0.1', usage = true } = {}) {
   const state = {
-    usage: [],
+    // the usage and runs pushes (beta), apart from the rules: `runs` below is the rule runs' staging
+    pushed: { usage: [], runs: [] },
     usageCalls: 0,
     apiCalls: [],
     runs: new Map(),
@@ -126,7 +145,13 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
         state.usageCalls += 1;
         if (req.headers.authorization !== basic) return json(res, 403, {});
         if (usage === 'broken') return json(res, 500, { errorMessages: ['gone'] });
-        const body = usageAnswer(p.slice(internal.length), url, rules);
+        let ask = url;
+        if (req.method === 'POST' && raw.length) {
+          // the audit log list is a POST with its paging in the body
+          const b = JSON.parse(raw.toString('utf8'));
+          ask = new URL(`http://x/?offset=${b.offset ? b.offset : ''}`);
+        }
+        const body = usageAnswer(p.slice(internal.length), ask, rules);
         return body === null ? json(res, 404, {}) : json(res, 200, body);
       }
 
@@ -189,10 +214,11 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       if (raw.some((b) => b > 0x7f)) state.nonAscii = true;
 
       // usage (beta): one chunk, checked and kept apart from the rules, like the real receiver
-      if (String(h('x-automap-kind') || 'rules') === 'usage') {
+      const kind = String(h('x-automap-kind') || 'rules');
+      if (kind === 'usage' || kind === 'runs') {
         if (seq !== 0 || !last) return answer('bad-request');
         if (sum && createHash('sha256').update(raw).digest('hex') !== sum) return answer('checksum');
-        state.usage.push(JSON.parse(raw.toString('utf8')));
+        state.pushed[kind].push(JSON.parse(raw.toString('utf8')));
         return answer('queued');
       }
 

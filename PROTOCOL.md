@@ -250,6 +250,38 @@ the sender also pushes the whole month before, so its final numbers land. `billa
 of the internal API most likely to change. The app keeps one snapshot per month
 (`src/usage/store.js`), the newest replacing the one before, and every month it has seen.
 
+## 6b. Runs (beta)
+
+From the same sender version, a run also reads the **audit log** of the last
+`AUTOMAP_RUNS_DAYS` days (7) — the internal API behind Jira's Audit log tab
+([automation-audit-log-api.md](automation-audit-log-api.md)) — folds it on the customer's
+side and pushes it as a **third push**, `X-Automap-Kind: runs`, one chunk, with the same
+rules as usage: never fails the run, spends no load, `AUTOMAP_RUNS=off` switches it off.
+
+What travels is counts and codes, nothing else: per rule and UTC day how many runs
+succeeded, failed, did nothing (`NO_ACTIONS_PERFORMED`) or were edits (`CONFIG_CHANGE`),
+the time spent; and for the rules that failed, up to two of their newest failed runs read in
+full (at most 40 per push) reduced to the failing component's id, type and the error's i18n
+key or code. No work-item ids, no message text (it can quote field values), no
+`appendParameters`, no account ids — the sender drops them and the receiver keeps only the
+fields below.
+
+```json
+{"runs":{
+  "window":{"start":1791331200000,"end":1791991583000},
+  "rows":[{"uuid":"019dd4aa-…","day":"2026-10-13","name":"MARKET: Licenses create",
+           "success":10,"errors":30,"noop":0,"edits":1,"ms":1200000,"maxMs":31000}],
+  "errors":[{"uuid":"019dd4aa-…","componentId":"5ce09150-…","componentType":"BRANCH",
+             "type":"jira.smart.values.branch",
+             "code":"com.codebarrel.automation.rule.error.smart.value.no.object","at":1791968400000}]},
+ "sender":{"name":"python","version":"1.1.0"}}
+```
+
+The window is whole UTC days and at most 31; a push replaces the days it covers and the app
+keeps 35 days back (`src/usage/runs.js`). The card shows a rule's runs over the last 30 days
+and the failing component in words; the Data tab lists the rules that fail most and the
+ones that mostly do nothing.
+
 ## 7. Reference senders
 
 Six, in [`senders/`](.) — Python (the one in the Docker image), Node, bash,

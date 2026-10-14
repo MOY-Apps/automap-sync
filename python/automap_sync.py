@@ -13,11 +13,18 @@ Environment
   AUTOMAP_KEY           the amk_... key from the app's settings
   optional: ATLASSIAN_CLOUD_ID, AUTOMAP_CHUNK_BYTES (200000), ATLASSIAN_API_BASE,
             AUTOMAP_USAGE=off (do not read or push automation usage)
+            AUTOMAP_RUNS=off (do not read or push the audit log), AUTOMAP_RUNS_DAYS (7)
 
 Automation usage (BETA, from 1.1.0): after the rules, the steps, Rovo credits and flow runs
 of the month are read from the same internal API Jira's Usage tab uses, and pushed as a
 second, separate push. That API is undocumented and can change; if it fails, the rules are
 pushed anyway and the run still succeeds. Account ids it returns are dropped here.
+
+Rule runs (BETA, from 1.1.0): the audit log of the last AUTOMAP_RUNS_DAYS days, folded here
+into per-rule, per-day counts (success / errors / nothing done / edits, time spent) plus, for
+the rules that failed, which component failed and the error's code - read from the same
+internal API as Jira's Audit log tab and pushed as a third push. Only codes travel: no
+issue ids, no message text (it can quote field values), no account ids.
 
 Usage:  python3 automap_sync.py [--dry-run]
 
@@ -221,6 +228,124 @@ class Usage:
         return out
 
 
+class Runs:
+    """The audit log (BETA), folded into what the map needs. Undocumented, like Usage."""
+
+    MAX_DETAILS = 40          # one request per failed run read in full; two per rule at most
+
+    def __init__(self, atlassian):
+        self.a = atlassian
+        self.base = f"{atlassian.api}/automation/internal-api/jira/{atlassian.cloud}/pro/rest/GLOBAL/"
+
+    def call(self, path, body=None):
+        headers = {"Authorization": self.a.auth, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        for attempt in range(1, 4):
+            try:
+                status, _, raw = request("POST" if body is not None else "GET", self.base + path, headers, data)
+            except OSError:
+                status, raw = None, b""
+            if status == 200:
+                return json.loads(raw)
+            if status not in (None, 429) and status < 500:
+                break
+            time.sleep(2 * attempt)
+        raise ValueError(f"{path.split('?')[0]} answered {status}")
+
+    @staticmethod
+    def day(ms):
+        return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))
+
+    def read(self, days, now_ms):
+        start = now_ms - days * 86400000
+        start -= start % 86400000          # whole days, so a day pushed is a day complete
+        records, offset = [], 0
+        while offset < 50000:              # 50 a page whatever is asked; `total` is always 0
+            page = (self.call("auditlog", {"fromTime": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(start / 1000)),
+                                           "offset": offset, "limit": 50}).get("items") or {}).get("items") or []
+            records += page
+            if len(page) < 50:
+                break
+            offset += 50
+        rows = {}
+        failed = {}
+        for r in records:
+            u = r.get("ruleIdUuid")
+            t = r.get("eventTimestamp") or r.get("startTime")
+            if not u or not t or t < start:
+                continue
+            key = (u, self.day(t))
+            row = rows.setdefault(key, {"uuid": u, "day": key[1], "name": r.get("ruleName") or "",
+                                        "success": 0, "errors": 0, "noop": 0, "edits": 0, "ms": 0, "maxMs": 0})
+            cat = r.get("category")
+            if cat == "CONFIG_CHANGE":
+                row["edits"] += 1
+                continue
+            row["success" if cat == "SUCCESS" else "noop" if cat == "NO_ACTIONS_PERFORMED" else "errors"] += 1
+            ms = r.get("durationMs") or 0
+            row["ms"] += ms
+            row["maxMs"] = max(row["maxMs"], ms)
+            if cat not in ("SUCCESS", "NO_ACTIONS_PERFORMED") and r.get("id"):
+                failed.setdefault(u, []).append(r)
+        errors, budget = [], self.MAX_DETAILS
+        for u, runs in failed.items():
+            for r in sorted(runs, key=lambda x: -(x.get("eventTimestamp") or 0))[:2]:
+                if budget <= 0:
+                    break
+                budget -= 1
+                try:
+                    detail = self.call(f"auditlog/item/{r['id']}")
+                except (ValueError, OSError):
+                    continue
+                for cl in (detail.get("content") or {}).get("componentLogs") or []:
+                    res = cl.get("executionResult") or {}
+                    keys = [((ch.get("payload") or {}).get("key") or "") for ch in cl.get("changes") or []
+                            if (ch.get("payload") or {}).get("type") == "ERROR"]
+                    code = (keys[0] if keys else "") or res.get("auditEventErrorType") or res.get("errorType") or ""
+                    if not code and res.get("state") != "SOME_ERRORS":
+                        continue
+                    comp = cl.get("component") or {}
+                    errors.append({"uuid": u, "componentId": comp.get("id") or "", "componentType": comp.get("componentType") or "",
+                                   "type": comp.get("type") or "", "code": code or "SOME_ERRORS",
+                                   "at": r.get("eventTimestamp") or 0})
+        return {"window": {"start": start, "end": now_ms}, "rows": list(rows.values()), "errors": errors}
+
+
+def push_runs(atlassian, dry_run):
+    """Read the audit log and push it folded; a failure is logged and the run goes on."""
+    if os.environ.get("AUTOMAP_RUNS", "").lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        days = max(1, min(30, int(os.environ.get("AUTOMAP_RUNS_DAYS") or 7)))
+        runs = Runs(atlassian).read(days, int(time.time() * 1000))
+        doc = {"runs": runs, "sender": {"name": NAME, "version": VERSION}}
+        payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
+        while len(payload) > 250000 and runs["rows"]:
+            runs["rows"] = sorted(runs["rows"], key=lambda x: -(x["success"] + x["errors"] + x["noop"]))[: len(runs["rows"]) * 3 // 4]
+            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
+        total = sum(x["success"] + x["errors"] + x["noop"] for x in runs["rows"])
+        failed = sum(x["errors"] for x in runs["rows"])
+        if dry_run:
+            log(f"runs (beta) last {days} days: {total} runs, {failed} with errors; nothing pushed")
+            return
+        data = payload.encode("ascii")
+        status, _, body = request("POST", env("AUTOMAP_URL"), {
+            "Authorization": f"Bearer {env('AUTOMAP_KEY')}", "Content-Type": "text/plain; charset=utf-8",
+            "X-Automap-Run": uuid.uuid4().hex, "X-Automap-Seq": "0", "X-Automap-Last": "1",
+            "X-Automap-Sha256": hashlib.sha256(data).hexdigest(), "X-Automap-Sender": f"{NAME}/{VERSION}",
+            "X-Automap-Kind": "runs",
+        }, data)
+        if status == 202:
+            log(f"runs (beta) last {days} days: pushed {total} runs, {failed} with errors")
+        else:
+            log(f"runs (beta): not taken, receiver answered {status} {_word(body)}")
+    except (ValueError, OSError, KeyError, TypeError) as err:
+        log(f"runs (beta) skipped: {err}")
+
+
 def push_usage(atlassian, dry_run):
     """Read and push the usage; a failure is logged and the run goes on."""
     if os.environ.get("AUTOMAP_USAGE", "").lower() in ("off", "0", "false", "no"):
@@ -325,6 +450,7 @@ def main(argv):
         # usage is a push of its own and spends no load, so it goes even when the rules
         # were refused (an allowance used up, say); it never changes the exit code
         push_usage(atlassian, dry_run)
+        push_runs(atlassian, dry_run)
         if stopped:
             raise stopped
         return 0

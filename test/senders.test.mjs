@@ -123,26 +123,39 @@ test('python: usage (beta) is pushed apart from the rules, without account ids, 
     const { code, out } = await runSender(py, site);
     assert.equal(code, 0, out);
     assert.equal(site.state.loaded.length, 1, 'the rules, once');
-    assert.equal(site.state.usage.length >= 1, true, out);
-    const u = site.state.usage[site.state.usage.length - 1].usage;
+    assert.equal(site.state.pushed.usage.length >= 1, true, out);
+    const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
     assert.equal(u.steps.total, 1310);
     assert.deepEqual(u.flows.map((f) => [f.uuid, f.runs, f.steps]), [[rules[0].uuid, 14, 1303], [rules[1].uuid, 5, 7]]);
     assert.deepEqual(u.billable.rules, [{ uuid: rules[0].uuid, runs: 14 }]);
     assert.deepEqual(u.limits, [{ product: 'JIRA_SERVICE_MANAGEMENT', used: 18, limit: 3000, edition: 'premium' }]);
-    assert.ok(!JSON.stringify(site.state.usage).includes('secret'), 'no account id leaves the sender');
+    assert.ok(!JSON.stringify(site.state.pushed.usage).includes('secret'), 'no account id leaves the sender');
     assert.match(out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+
+    // runs (beta): counted per rule and day, the failing component by code - and nothing else
+    assert.ok(site.state.pushed.runs.length >= 1, out);
+    const r = site.state.pushed.runs[site.state.pushed.runs.length - 1].runs;
+    const a = r.rows.find((x) => x.uuid === rules[0].uuid);
+    assert.deepEqual([a.success, a.errors, a.noop], [1, 1, 0]);
+    const b = r.rows.find((x) => x.uuid === rules[1].uuid);
+    assert.deepEqual([b.noop, b.edits], [1, 1]);
+    assert.deepEqual(r.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
+    const sent = JSON.stringify(site.state.pushed.runs);
+    assert.ok(!sent.includes('secret-') && !sent.includes('10042'), 'no message text, no parameters, no work item ids');
+    assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
 
     // the internal API gone: the rules still go, the run still succeeds
     const gone = await runSender(py, broken);
     assert.equal(gone.code, 0, gone.out);
     assert.equal(broken.state.loaded.length, 1);
-    assert.equal(broken.state.usage.length, 0);
+    assert.equal(broken.state.pushed.usage.length, 0);
     assert.match(gone.out, /usage \(beta\) skipped/);
+    assert.match(gone.out, /runs \(beta\) skipped/);
 
     // switched off: not even read
-    const before = site.state.usageCalls;
-    assert.equal((await runSender(py, site, { AUTOMAP_USAGE: 'off' })).code, 0);
-    assert.equal(site.state.usageCalls, before);
+    const before = site.state.pushed.usageCalls;
+    assert.equal((await runSender(py, site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
+    assert.equal(site.state.pushed.usageCalls, before);
   } finally {
     await site.close();
     await broken.close();
