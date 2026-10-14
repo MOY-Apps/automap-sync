@@ -112,3 +112,39 @@ for (const s of SENDERS) {
     }
   });
 }
+
+// usage (beta): only the Python sender reads it so far
+const py = SENDERS.find((x) => x.name === 'python');
+test('python: usage (beta) is pushed apart from the rules, without account ids, and never fails the run', { skip: py.ok ? false : 'no python3', timeout: 120_000 }, async () => {
+  const rules = makeRules(3);
+  const site = await startFakeSite({ rules, flaky: false });
+  const broken = await startFakeSite({ rules, flaky: false, usage: 'broken' });
+  try {
+    const { code, out } = await runSender(py, site);
+    assert.equal(code, 0, out);
+    assert.equal(site.state.loaded.length, 1, 'the rules, once');
+    assert.equal(site.state.usage.length >= 1, true, out);
+    const u = site.state.usage[site.state.usage.length - 1].usage;
+    assert.equal(u.steps.total, 1310);
+    assert.deepEqual(u.flows.map((f) => [f.uuid, f.runs, f.steps]), [[rules[0].uuid, 14, 1303], [rules[1].uuid, 5, 7]]);
+    assert.deepEqual(u.billable.rules, [{ uuid: rules[0].uuid, runs: 14 }]);
+    assert.deepEqual(u.limits, [{ product: 'JIRA_SERVICE_MANAGEMENT', used: 18, limit: 3000, edition: 'premium' }]);
+    assert.ok(!JSON.stringify(site.state.usage).includes('secret'), 'no account id leaves the sender');
+    assert.match(out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+
+    // the internal API gone: the rules still go, the run still succeeds
+    const gone = await runSender(py, broken);
+    assert.equal(gone.code, 0, gone.out);
+    assert.equal(broken.state.loaded.length, 1);
+    assert.equal(broken.state.usage.length, 0);
+    assert.match(gone.out, /usage \(beta\) skipped/);
+
+    // switched off: not even read
+    const before = site.state.usageCalls;
+    assert.equal((await runSender(py, site, { AUTOMAP_USAGE: 'off' })).code, 0);
+    assert.equal(site.state.usageCalls, before);
+  } finally {
+    await site.close();
+    await broken.close();
+  }
+});

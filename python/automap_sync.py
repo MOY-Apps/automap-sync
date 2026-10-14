@@ -11,7 +11,13 @@ Environment
   ATLASSIAN_API_TOKEN   an API token with the Automation scope
   AUTOMAP_URL           the receiver URL from the app's settings, ending /v1/push
   AUTOMAP_KEY           the amk_... key from the app's settings
-  optional: ATLASSIAN_CLOUD_ID, AUTOMAP_CHUNK_BYTES (200000), ATLASSIAN_API_BASE
+  optional: ATLASSIAN_CLOUD_ID, AUTOMAP_CHUNK_BYTES (200000), ATLASSIAN_API_BASE,
+            AUTOMAP_USAGE=off (do not read or push automation usage)
+
+Automation usage (BETA, from 1.1.0): after the rules, the steps, Rovo credits and flow runs
+of the month are read from the same internal API Jira's Usage tab uses, and pushed as a
+second, separate push. That API is undocumented and can change; if it fails, the rules are
+pushed anyway and the run still succeeds. Account ids it returns are dropped here.
 
 Usage:  python3 automap_sync.py [--dry-run]
 
@@ -21,6 +27,7 @@ receiver (fix something, do not retry), 5 try later (allowance or rate limit), 6
 Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
 """
 import base64
+import calendar
 import hashlib
 import json
 import os
@@ -33,7 +40,7 @@ import urllib.request
 import uuid
 
 NAME = "python"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 UA = f"automap-sync-{NAME}/{VERSION}"
 
 EXIT_CONFIG, EXIT_ATLASSIAN, EXIT_REFUSED, EXIT_LATER, EXIT_FAILED = 2, 3, 4, 5, 6
@@ -134,6 +141,118 @@ class Atlassian:
         return out
 
 
+class Usage:
+    """Automation usage (BETA) from the internal API behind Jira's Usage tab.
+
+    Undocumented: every failure here is a reason to skip usage, never to fail the run.
+    Mapped to the receiver's own shape (docs/push-sync.md, "Usage"), so a change on
+    Atlassian's side is fixed in the senders. Account ids are not copied.
+    """
+
+    def __init__(self, atlassian):
+        self.a = atlassian
+        self.base = f"{atlassian.api}/automation/internal-api/jira/{atlassian.cloud}/pro/rest/GLOBAL/"
+
+    def get(self, path):
+        status, _, body = request("GET", self.base + path, {"Authorization": self.a.auth, "Accept": "application/json"})
+        if status != 200:
+            raise ValueError(f"{path.split('?')[0]} answered {status}")
+        return json.loads(body)
+
+    def flows(self, start, end):
+        by_rule = {}
+        # sortBy also filters to rules with that metric above zero: read both and merge
+        for sort_by in ("automationCredits", "rovoCredits"):
+            seen, page = 0, 0
+            while page < 100:
+                r = self.get(f"highUsageFlows?limit=100&page={page}&sortBy={sort_by}&startTime={start}&endTime={end}")
+                for f in r.get("flows") or []:
+                    if f.get("ruleUuid"):
+                        by_rule[f["ruleUuid"]] = {
+                            "uuid": f["ruleUuid"], "name": f.get("ruleName") or "", "state": f.get("state") or "ENABLED",
+                            "runs": f.get("runs") or 0, "steps": f.get("automationCredits") or 0,
+                            "rovo": f.get("rovoCredits") or 0, "deleted": bool(f.get("deleted")),
+                            "agentic": bool(f.get("containsAgentic")),
+                        }
+                seen += len(r.get("flows") or [])
+                if not r.get("flows") or seen >= (r.get("totalCount") or 0):
+                    break
+                page += 1
+        return list(by_rule.values())
+
+    def month(self, start, end, month):
+        credit = self.get(f"creditUsage?startTime={start}&endTime={end}")
+        pair = lambda c: {"total": (c or {}).get("total") or 0, "jira": (c or {}).get("currentProduct") or 0,
+                          "other": (c or {}).get("everywhereElse") or 0}
+        out = {"period": {"start": start, "end": end}, "steps": pair(credit.get("automation")),
+               "rovo": pair(credit.get("rovo")), "flows": self.flows(start, end)}
+        # the rest is the current billing model, and the least stable part: each piece optional
+        try:
+            top = self.get(f"highestUsages?limit=100&month={month}")
+            out["billable"] = {"month": month, "rules": [{"uuid": t.get("ruleIdUuid"), "runs": t.get("executionCount") or 0}
+                                                         for t in top if t.get("ruleIdUuid")]}
+        except (ValueError, OSError):
+            pass
+        try:
+            ws = ((self.get("pagecontext").get("tenantPageContext") or {}).get("usage") or {}).get("workspaceUsages") or {}
+            out["limits"] = [{"product": k, "used": v.get("executionsUsed") or 0, "limit": v.get("executionLimit") or 0,
+                              "edition": v.get("edition") or ""} for k, v in ws.items()]
+        except (ValueError, OSError, AttributeError):
+            pass
+        try:
+            out["trend"] = [{"month": t.get("month"), "runs": t.get("workspaceCounts") or {}}
+                            for t in self.get("usageTrendData").get("data") or []]
+        except (ValueError, OSError, AttributeError):
+            pass
+        try:
+            out["creditPack"] = bool(self.get("hasCreditPack").get("hasCreditPack"))
+        except (ValueError, OSError, AttributeError):
+            pass
+        return out
+
+    def periods(self, now_ms):
+        """This month so far; and in its first three days the whole of the month before."""
+        now = time.gmtime(now_ms / 1000)
+        start = int(calendar.timegm((now.tm_year, now.tm_mon, 1, 0, 0, 0)) * 1000)
+        out = [(start, now_ms, f"{now.tm_year:04d}-{now.tm_mon:02d}")]
+        if now.tm_mday <= 3:
+            y, m = (now.tm_year, now.tm_mon - 1) if now.tm_mon > 1 else (now.tm_year - 1, 12)
+            out.insert(0, (int(calendar.timegm((y, m, 1, 0, 0, 0)) * 1000), start - 1, f"{y:04d}-{m:02d}"))
+        return out
+
+
+def push_usage(atlassian, dry_run):
+    """Read and push the usage; a failure is logged and the run goes on."""
+    if os.environ.get("AUTOMAP_USAGE", "").lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        u = Usage(atlassian)
+        for start, end, month in u.periods(int(time.time() * 1000)):
+            doc = {"usage": u.month(start, end, month), "sender": {"name": NAME, "version": VERSION}}
+            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
+            # one chunk: keep the busiest rules if a huge site does not fit
+            while len(payload) > 250000 and doc["usage"]["flows"]:
+                doc["usage"]["flows"] = sorted(doc["usage"]["flows"], key=lambda f: -f["steps"])[: len(doc["usage"]["flows"]) * 3 // 4]
+                payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
+            steps, rules = doc["usage"]["steps"]["total"], len(doc["usage"]["flows"])
+            if dry_run:
+                log(f"usage (beta) {month}: {steps} steps, {rules} rules with usage; nothing pushed")
+                continue
+            data = payload.encode("ascii")
+            status, _, body = request("POST", env("AUTOMAP_URL"), {
+                "Authorization": f"Bearer {env('AUTOMAP_KEY')}", "Content-Type": "text/plain; charset=utf-8",
+                "X-Automap-Run": uuid.uuid4().hex, "X-Automap-Seq": "0", "X-Automap-Last": "1",
+                "X-Automap-Sha256": hashlib.sha256(data).hexdigest(), "X-Automap-Sender": f"{NAME}/{VERSION}",
+                "X-Automap-Kind": "usage",
+            }, data)
+            if status == 202:
+                log(f"usage (beta) {month}: pushed {steps} steps for {rules} rules")
+            else:
+                log(f"usage (beta) {month}: not taken, receiver answered {status} {_word(body)}")
+    except (ValueError, OSError, KeyError, TypeError) as err:
+        log(f"usage (beta) skipped: {err}")
+
+
 def push(payload, dry_run):
     data = payload.encode("ascii")
     checksum = hashlib.sha256(data).hexdigest()
@@ -194,10 +313,20 @@ def _word(body):
 def main(argv):
     dry_run = "--dry-run" in argv or os.environ.get("AUTOMAP_DRY_RUN") == "1"
     try:
-        rules = Atlassian().rules()
+        atlassian = Atlassian()
+        rules = atlassian.rules()
         doc = {"rules": rules, "sender": {"name": NAME, "version": VERSION, "rules": len(rules)}}
-        # compact and ASCII-only: \\uXXXX for everything else, so a byte split is a safe split
-        push(json.dumps(doc, separators=(",", ":"), ensure_ascii=True), dry_run)
+        stopped = None
+        try:
+            # compact and ASCII-only: \\uXXXX for everything else, so a byte split is a safe split
+            push(json.dumps(doc, separators=(",", ":"), ensure_ascii=True), dry_run)
+        except Stop as stop:
+            stopped = stop
+        # usage is a push of its own and spends no load, so it goes even when the rules
+        # were refused (an allowance used up, say); it never changes the exit code
+        push_usage(atlassian, dry_run)
+        if stopped:
+            raise stopped
         return 0
     except Stop as stop:
         log(str(stop))

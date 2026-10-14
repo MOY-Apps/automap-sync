@@ -61,8 +61,43 @@ const ANSWERS = {
  * @param flaky        whether to fail once: page 2 with 429, chunk 1 of run 1 with 500
  * @param host         the name the sender should use for this server
  */
-export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null, flaky = true, host = '127.0.0.1' } = {}) {
+/**
+ * The internal API behind Jira's Usage tab (docs/automation-usage-api.md), as observed:
+ * the first two rules spent steps this month, nobody spent Rovo credits. `usage: 'broken'`
+ * answers 500 everywhere, as it will the day Atlassian changes it.
+ */
+function usageAnswer(name, url, rules) {
+  const [a, b] = rules;
+  const flows = [
+    { ruleUuid: a.uuid, ruleName: a.name, state: 'ENABLED', runs: 14, automationCredits: 1303, rovoCredits: 0,
+      containsAgentic: false, deleted: false, actorAccountId: '557058:actor-secret', authorAccountId: '712020:author-secret' },
+    { ruleUuid: b.uuid, ruleName: b.name, state: 'ENABLED', runs: 5, automationCredits: 7, rovoCredits: 0 },
+  ];
+  switch (name) {
+    case 'creditUsage':
+      return { automation: { total: 1310, currentProduct: 1310, everywhereElse: 0 }, rovo: { total: 0, currentProduct: 0, everywhereElse: 0 } };
+    case 'highUsageFlows': {
+      const list = url.searchParams.get('sortBy') === 'rovoCredits' ? [] : flows;
+      const page = Number(url.searchParams.get('page') || 0);
+      return { flows: page === 0 ? list : [], totalCount: list.length, page, pageSize: 100 };
+    }
+    case 'highestUsages':
+      return [{ ruleIdUuid: a.uuid, executionCount: 14, ruleMetadata: { name: a.name, authorAccountId: '712020:author-secret' } }];
+    case 'pagecontext':
+      return { tenantPageContext: { usage: { workspaceUsages: { JIRA_SERVICE_MANAGEMENT: { executionsUsed: 18, executionLimit: 3000, edition: 'premium' } } } } };
+    case 'usageTrendData':
+      return { data: [{ month: '2026-09', workspaceCounts: { JIRA_SERVICE_MANAGEMENT: 1073 } }] };
+    case 'hasCreditPack':
+      return { hasCreditPack: false };
+    default:
+      return null;
+  }
+}
+
+export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null, flaky = true, host = '127.0.0.1', usage = true } = {}) {
   const state = {
+    usage: [],
+    usageCalls: 0,
     apiCalls: [],
     runs: new Map(),
     loaded: [],
@@ -85,6 +120,15 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       const p = url.pathname;
 
       if (p === '/_edge/tenant_info') return json(res, 200, { cloudId: CLOUD_ID });
+
+      const internal = `/automation/internal-api/jira/${CLOUD_ID}/pro/rest/GLOBAL/`;
+      if (p.startsWith(internal)) {
+        state.usageCalls += 1;
+        if (req.headers.authorization !== basic) return json(res, 403, {});
+        if (usage === 'broken') return json(res, 500, { errorMessages: ['gone'] });
+        const body = usageAnswer(p.slice(internal.length), url, rules);
+        return body === null ? json(res, 404, {}) : json(res, 200, body);
+      }
 
       const api = `/automation/public/jira/${CLOUD_ID}/rest/v1`;
       if (p.startsWith(api)) {
@@ -143,6 +187,14 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       if (String(h('content-encoding') || '').includes('gzip') || !raw.length) return answer('bad-request');
       if (raw.length > 256 * 1024) return answer('too-large');
       if (raw.some((b) => b > 0x7f)) state.nonAscii = true;
+
+      // usage (beta): one chunk, checked and kept apart from the rules, like the real receiver
+      if (String(h('x-automap-kind') || 'rules') === 'usage') {
+        if (seq !== 0 || !last) return answer('bad-request');
+        if (sum && createHash('sha256').update(raw).digest('hex') !== sum) return answer('checksum');
+        state.usage.push(JSON.parse(raw.toString('utf8')));
+        return answer('queued');
+      }
 
       let entry = state.runs.get(run);
       if (seq === 0) {

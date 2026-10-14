@@ -205,6 +205,51 @@ not do this for you — every completed run is a build).
   header values). The sender passes them through TLS to the app, where the build replaces
   every recognised secret with a fingerprint before anything is parsed or stored.
 
+## 6a. Usage (beta)
+
+From sender 1.1.0 (Python first), a run also reads the site's **automation usage** — the
+steps, Rovo credits and flow runs of the month, as Jira's own Usage tab shows them — and
+pushes it as a **second, separate push**. The numbers come from an undocumented internal
+Automation API ([automation-usage-api.md](automation-usage-api.md)) that only a personal
+API token can read; Atlassian can change or close it without notice. So:
+
+- **It never fails a run.** If the internal API answers anything but 200, the sender logs
+  `usage (beta) skipped: …` and exits as it would have without it. The rules go first and
+  do not wait for it. `AUTOMAP_USAGE=off` switches it off entirely.
+- **It spends no load.** A usage push is not a map: no build, no allowance, and it goes
+  even when the rules were refused for the allowance.
+- **The payload is ours, not Atlassian's.** The sender maps the internal names to the shape
+  below, so a change on Atlassian's side is fixed in the senders. Account ids that the
+  internal API returns (`actorAccountId`, `authorAccountId`) are dropped by the sender, and
+  the receiver keeps only the fields below whatever arrives.
+
+**Headers:** as any push, plus `X-Automap-Kind: usage`; one chunk (`X-Automap-Seq: 0`,
+`X-Automap-Last: 1`, `X-Automap-Sha256`), at most 256 KiB — a sender keeps the busiest rules
+if a huge site does not fit. Answers: `202 queued`, `400 bad-request` (not one whole chunk,
+not usage), `422 checksum`, and the key and rate answers of any push.
+
+**Body:**
+
+```json
+{"usage":{
+  "period":{"start":1790812800000,"end":1791990000000},
+  "steps":{"total":1322,"jira":1322,"other":0},
+  "rovo":{"total":0,"jira":0,"other":0},
+  "flows":[{"uuid":"019dd4aa-…","name":"MARKET: Licenses create","state":"ENABLED",
+            "runs":14,"steps":1303,"rovo":0,"deleted":false,"agentic":false}],
+  "billable":{"month":"2026-10","rules":[{"uuid":"019dd4aa-…","runs":14}]},
+  "limits":[{"product":"JIRA_SERVICE_MANAGEMENT","used":18,"limit":3000,"edition":"premium"}],
+  "trend":[{"month":"2026-09","runs":{"JIRA_SERVICE_MANAGEMENT":1073}}],
+  "creditPack":false},
+ "sender":{"name":"python","version":"1.1.0"}}
+```
+
+`period` is Unix ms, UTC: the 1st of the month to now. In the first three days of a month
+the sender also pushes the whole month before, so its final numbers land. `billable`,
+`limits`, `trend` and `creditPack` are optional — the current billing model, and the part
+of the internal API most likely to change. The app keeps one snapshot per month
+(`src/usage/store.js`), the newest replacing the one before, and every month it has seen.
+
 ## 7. Reference senders
 
 Six, in [`senders/`](.) — Python (the one in the Docker image), Node, bash,
