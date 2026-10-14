@@ -449,8 +449,11 @@ def main(argv):
             stopped = stop
         # usage is a push of its own and spends no load, so it goes even when the rules
         # were refused (an allowance used up, say); it never changes the exit code
-        push_usage(atlassian, dry_run)
-        push_runs(atlassian, dry_run)
+        # ...but not when the receiver shut the door (403: switched off, or not on this
+        # plan) - reading the internal APIs for an answer known in advance is wasted
+        if not (stopped and stopped.code == EXIT_REFUSED and "403" in str(stopped)):
+            push_usage(atlassian, dry_run)
+            push_runs(atlassian, dry_run)
         if stopped:
             raise stopped
         return 0

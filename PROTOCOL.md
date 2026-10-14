@@ -173,7 +173,7 @@ Atlassian). Read the **status code**; the `error` word separates the two 429s.
 | 400 | `bad-request` — a header missing or malformed, empty or compressed body, `Last` without a checksum | fix the sender; do not retry as is |
 | 401 | `unauthorized` — no key, wrong key, revoked key | stop; the administrator makes a new key |
 | 402 | `inactive` — the subscription on this site has ended | stop |
-| 403 | `disabled` — this installation does not take pushes | stop |
+| 403 | `disabled` — this installation does not take pushes: switched off, or the site is on Basic, where the map loads from an export file only (remembered as `plan` on the settings page) | stop |
 | 404 / 405 | `not-found` / `method` | wrong URL or verb |
 | 409 | `conflict` — out of order, unknown run, run already closed, `Last` sent early | start a **new run** from chunk 0 |
 | 413 | `too-large` — chunk over 256 KiB | send smaller chunks |
@@ -216,9 +216,8 @@ API token can read; Atlassian can change or close it without notice. So:
 - **It never fails a run.** If the internal API answers anything but 200, the sender logs
   `usage (beta) skipped: …` and exits as it would have without it. The rules go first and
   do not wait for it. `AUTOMAP_USAGE=off` switches it off entirely.
-- **Advanced only.** On Basic the receiver answers `403 disabled` to a usage or runs push
-  and keeps nothing: a site that moved down keeps its job running, not the feature. The
-  rules push before it is taken as before.
+- **Advanced only**, like every push: on Basic the receiver answers `403 disabled` and
+  keeps nothing (the 403 row in section 4).
 - **It spends no load.** A usage push is not a map: no build, no allowance, and it goes
   even when the rules were refused for the allowance.
 - **The payload is ours, not Atlassian's.** The sender maps the internal names to the shape
