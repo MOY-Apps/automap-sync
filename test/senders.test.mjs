@@ -139,6 +139,11 @@ test('python: usage (beta) is pushed apart from the rules, without account ids, 
     assert.deepEqual([a.success, a.errors, a.noop], [1, 1, 0]);
     const b = r.rows.find((x) => x.uuid === rules[1].uuid);
     assert.deepEqual([b.noop, b.edits], [1, 1]);
+    // runs per UTC hour, edits not among them
+    const perHour = (u) => r.rows.filter((x) => x.uuid === u)
+      .reduce((n, x) => n + Object.values(x.hours || {}).reduce((m, v) => m + v, 0), 0);
+    assert.equal(perHour(rules[0].uuid), 2);
+    assert.equal(perHour(rules[1].uuid), 1);
     assert.deepEqual(r.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
     const sent = JSON.stringify(site.state.pushed.runs);
     assert.ok(!sent.includes('secret-') && !sent.includes('10042'), 'no message text, no parameters, no work item ids');

@@ -272,14 +272,17 @@ fields below.
 {"runs":{
   "window":{"start":1791331200000,"end":1791991583000},
   "rows":[{"uuid":"019dd4aa-…","day":"2026-10-13","name":"MARKET: Licenses create",
-           "success":10,"errors":30,"noop":0,"edits":1,"ms":1200000,"maxMs":31000}],
+           "success":10,"errors":30,"noop":0,"edits":1,"ms":1200000,"maxMs":31000,
+           "hours":{"9":12,"14":28}}],
   "errors":[{"uuid":"019dd4aa-…","componentId":"5ce09150-…","componentType":"BRANCH",
              "type":"jira.smart.values.branch",
              "code":"com.codebarrel.automation.rule.error.smart.value.no.object","at":1791968400000}]},
  "sender":{"name":"python","version":"1.1.0"}}
 ```
 
-The window is whole UTC days and at most 31; a push replaces the days it covers and the app
+`hours` is optional and sparse: runs (not edits) per UTC hour of that day, only the hours
+that had any. It is what shows a burst - hundreds of runs inside one hour after a bulk
+edit or an import - which a day's total hides. The window is whole UTC days and at most 31; a push replaces the days it covers and the app
 keeps 35 days back (`src/usage/runs.js`). The card shows a rule's runs over the last 30 days
 and the failing component in words; the Data tab lists the rules that fail most and the
 ones that mostly do nothing.

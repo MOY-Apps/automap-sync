@@ -285,6 +285,11 @@ class Runs:
                 row["edits"] += 1
                 continue
             row["success" if cat == "SUCCESS" else "noop" if cat == "NO_ACTIONS_PERFORMED" else "errors"] += 1
+            # runs per UTC hour, only the hours that had any: a burst (a bulk edit, an import)
+            # is hundreds of runs inside one hour, which a day's total cannot show
+            hour = str(time.gmtime(t / 1000).tm_hour)
+            row.setdefault("hours", {})
+            row["hours"][hour] = row["hours"].get(hour, 0) + 1
             ms = r.get("durationMs") or 0
             row["ms"] += ms
             row["maxMs"] = max(row["maxMs"], ms)
