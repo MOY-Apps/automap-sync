@@ -216,6 +216,9 @@ API token can read; Atlassian can change or close it without notice. So:
 - **It never fails a run.** If the internal API answers anything but 200, the sender logs
   `usage (beta) skipped: …` and exits as it would have without it. The rules go first and
   do not wait for it. `AUTOMAP_USAGE=off` switches it off entirely.
+- **Advanced only.** On Basic the receiver answers `403 disabled` to a usage or runs push
+  and keeps nothing: a site that moved down keeps its job running, not the feature. The
+  rules push before it is taken as before.
 - **It spends no load.** A usage push is not a map: no build, no allowance, and it goes
   even when the rules were refused for the allowance.
 - **The payload is ours, not Atlassian's.** The sender maps the internal names to the shape
