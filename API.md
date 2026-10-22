@@ -178,6 +178,49 @@ Atlassian API that can change without notice; see
   another usage push left half-sent (the same for runs).
 - On `403`, skip them: the site does not take them.
 
+### Large sites: parts
+
+A job inside Jira (ScriptRunner, JMWE) has a time limit, and reading more than a few hundred
+rules one by one does not fit in it. So the rules may come in **parts**: several scheduled
+copies of the job, each reading its share of the rules and pushing it as a complete rules
+document of its own, with `X-Automap-Part: N/M` on every chunk. The receiver merges the
+parts and builds once.
+
+- Each part is a push exactly as above: its own chunks from `X-Automap-Seq: 0`, its own
+  proof on its last chunk, the same document shape (just fewer rules). Reuse your chunk code.
+- All parts of one build share the **run id**. Jobs that cannot talk to each other agree on
+  it by the date: our senders use `d<YYYYMMDD>` in UTC, `d20261023`.
+- `N/M` is the same on every chunk of the part; `M` is the same on every part. A part with
+  another `M` is `409`.
+- The last chunk of a part is answered `202 accepted` while parts are missing, and
+  `202 queued` when it completed the group. Parts may come in any order. The group is **one
+  load**, checked when its first chunk 0 arrives.
+- A part sent again (chunk 0 of a part already in) replaces that part. A part whose proof
+  fails (`422`) is dropped alone; the others stay, send that part again.
+- A group not complete after **24 hours** is abandoned: the next chunk 0 of any of its parts
+  starts it over, as a new load.
+- Merging: the rules of every part, in part order, a rule in two parts kept once (the later
+  part's copy; by `uuid`, or `id` without one), `sender` from the part that completed the
+  group, and `"parts": M` added. Usage and runs do not come in parts (`400`).
+
+Two parts with curl, each a document of its own, an hour apart or at once:
+
+```bash
+for PART in 1 2; do
+  BODY=$(cat "rules-part-$PART.json")        # {"rules":[...]} - this part's share, compact
+  SUM=$(printf '%s' "$BODY" | shasum -a 256 | cut -d' ' -f1)
+  curl -sS -X POST "$URL" \
+    -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: text/plain; charset=utf-8' \
+    -H "X-Automap-Run: d$(date -u +%Y%m%d)" \
+    -H 'X-Automap-Seq: 0' -H 'X-Automap-Last: 1' -H "X-Automap-Sha256: $SUM" \
+    -H "X-Automap-Part: $PART/2" \
+    --data-binary "$BODY" -w '\n%{http_code}\n'
+done
+# {"accepted":true}            202   - part 1 in, one to come
+# {"accepted":true,"queued":true}  202   - part 2 completed the group: one build
+```
+
 ### 8. Schedule
 
 Once a day is right. Each rules push that builds counts as a load: Advanced has 5 in a
@@ -197,6 +240,7 @@ To save loads, keep the last checksum and skip the rules push when it has not ch
 | `X-Automap-Sha256` | last chunk | 64 hex characters: SHA-256 of the whole text's UTF-8 bytes | 1.0.0 |
 | `X-Automap-Length` | last chunk | the whole text's length in UTF-16 code units | 1.0.0 (JMWE) |
 | `X-Automap-Kind` | every chunk | `rules` (default), `usage` or `runs` | 1.1.0 |
+| `X-Automap-Part` | every chunk of a part, rules only | `N/M`: part N of M complete rules documents under one run id, 1 <= N <= M, 2 <= M <= 20; see [Large sites: parts](#large-sites-parts) | receiver 2026-10-23 (scriptrunner, jmwe 1.4.0) |
 | `X-Automap-Sender` | every chunk | `<name>/<major>.<minor>.<patch>`, optional | 1.0.0 |
 | `Content-Type` | every chunk | `text/plain; charset=utf-8` | 1.0.0 |
 | `Content-Encoding` | — | do not send `gzip` | — |
@@ -290,17 +334,17 @@ Every answer is JSON from a fixed list. `error` names it; `detail` is a fixed se
 | Status | Answer | Means | What the sender does |
 |---|---|---|---|
 | 200 | `alive` | `GET /v1`: the receiver is there | — |
-| 202 | `accepted` | the chunk is stored | send the next chunk |
+| 202 | `accepted` | the chunk is stored; or the last chunk of a part while other parts are still to come | send the next chunk (or the next part) |
 | 202 | `queued` | the last chunk proved the whole. Rules: build queued. Usage, runs: kept | done |
-| 400 | `bad-request` | a header missing or malformed; seq 400 or more; empty or gzip body; usage or runs that is not JSON or not the right shape | fix the sender |
+| 400 | `bad-request` | a header missing or malformed (`X-Automap-Part` not `N/M` in range, or on usage or runs); seq 400 or more; empty or gzip body; usage or runs that is not JSON or not the right shape; a part that is not a rules document | fix the sender |
 | 401 | `unauthorized` | no key, wrong key, revoked key | stop; make a new key in the app |
 | 402 | `inactive` | the subscription on this site has ended | stop |
 | 403 | `disabled` | this installation does not take this push: sync not switched on, or the site is on Basic | stop; skip usage and runs too |
 | 404 | `not-found` | the path is not `/v1/push` (or `GET /v1`) | fix the URL |
 | 405 | `method` | not `POST` on `/v1/push` | use POST |
-| 409 | `conflict` | chunk out of order, unknown run, last chunk while chunks are missing, or (rules) a run already closed | new run from chunk 0 |
+| 409 | `conflict` | chunk out of order, unknown run, last chunk while chunks are missing, or (rules) a run already closed; a part whose `M` differs from the group's, or for a group already built | new run from chunk 0 |
 | 413 | `too-large` | the chunk is over 262,144 bytes | send 200,000-byte chunks |
-| 422 | `checksum` | the joined chunks do not match the SHA-256 or the length; nothing kept, the previous map stays | new run; if it repeats, check line breaks, the hash input and compression |
+| 422 | `checksum` | the joined chunks do not match the SHA-256 or the length; nothing kept, the previous map stays. A part: only that part is dropped, the group stays | new run (a part: the same part again from chunk 0); if it repeats, check line breaks, the hash input and compression |
 | 426 | `upgrade` | `X-Automap-Sender` names one of our senders below its minimum | update the sender |
 | 429 | `allowance` | rules only: the plan's loads are used up | stop; try after the window moves |
 | 429 | `rate-limited` | over 300 requests in the current 10-minute window | wait ten minutes, then a new run |

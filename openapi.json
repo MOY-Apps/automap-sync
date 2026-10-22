@@ -87,6 +87,7 @@
           { "$ref": "#/components/parameters/Sha256" },
           { "$ref": "#/components/parameters/Length" },
           { "$ref": "#/components/parameters/Kind" },
+          { "$ref": "#/components/parameters/Part" },
           { "$ref": "#/components/parameters/Sender" },
           { "$ref": "#/components/parameters/ContentEncoding" }
         ],
@@ -127,7 +128,7 @@
         },
         "responses": {
           "202": {
-            "description": "Taken. `accepted`: the chunk is stored; send the next one. `queued`: the last chunk proved the whole document. For rules a build is queued and the map rebuilds in a minute or two. For usage and runs the data is already kept (nothing is queued, despite the word).",
+            "description": "Taken. `accepted`: the chunk is stored; send the next one. Also the last chunk of a part (X-Automap-Part) while other parts are still to come. `queued`: the last chunk proved the whole document. For rules a build is queued and the map rebuilds in a minute or two. For usage and runs the data is already kept (nothing is queued, despite the word).",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Accepted" },
@@ -139,7 +140,7 @@
             }
           },
           "400": {
-            "description": "Not a push. A header is missing or malformed (run id, seq, kind, a last chunk without a valid X-Automap-Sha256 or X-Automap-Length), seq is 400 or more, the body is empty or compressed. For usage and runs also: the joined document is not JSON, or not a usage / runs document (for example no `period`, or a runs window over 31 days). Fix the sender; sending the same request again will not help.",
+            "description": "Not a push. A header is missing or malformed (run id, seq, kind, a last chunk without a valid X-Automap-Sha256 or X-Automap-Length, an X-Automap-Part that is not N/M within 1 <= N <= M <= 20 or that is sent on usage or runs), seq is 400 or more, the body is empty or compressed. For a part also: the part proved whole is not a rules document (that part is dropped; the group stays). For usage and runs also: the joined document is not JSON, or not a usage / runs document (for example no `period`, or a runs window over 31 days). Fix the sender; sending the same request again will not help.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -205,7 +206,7 @@
             }
           },
           "409": {
-            "description": "Out of order. Chunk n arrived before chunks 0 to n-1 of the same run; the run is unknown; the last chunk came while chunks are missing; or (rules only) the run is already closed, because its last chunk was taken. Start a new run, with a new run id, from chunk 0. A 409 on a resent last chunk of rules can mean the first copy arrived and the push is done.",
+            "description": "Out of order. Chunk n arrived before chunks 0 to n-1 of the same run; the run is unknown; the last chunk came while chunks are missing; or (rules only) the run is already closed, because its last chunk was taken. For a part (X-Automap-Part): its M differs from the group's, or the group's build is already queued. Start a new run, with a new run id, from chunk 0. A 409 on a resent last chunk of rules can mean the first copy arrived and the push is done.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -227,7 +228,7 @@
             }
           },
           "422": {
-            "description": "The joined chunks do not match X-Automap-Sha256 or X-Automap-Length. Nothing was kept; for rules the build is marked failed and the previous map stays. Start a new run. If it repeats, check that the document is compact JSON without line breaks, the hash is over the UTF-8 bytes, the length counts UTF-16 code units, and nothing compresses or rewrites the body on the way.",
+            "description": "The joined chunks do not match X-Automap-Sha256 or X-Automap-Length. Nothing was kept; for rules the build is marked failed and the previous map stays. For a part (X-Automap-Part) only that part is dropped: the group and its other parts stay, send the part again from its chunk 0. Start a new run. If it repeats, check that the document is compact JSON without line breaks, the hash is over the UTF-8 bytes, the length counts UTF-16 code units, and nothing compresses or rewrites the body on the way.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -337,6 +338,14 @@
         "description": "What the push carries. Without it, `rules`, as every sender before 1.1.0 sent. `usage` and `runs` are beta and need the Advanced edition. Any case. Send it on every chunk of the run. Since 1.1.0.",
         "schema": { "type": "string", "enum": ["rules", "usage", "runs"], "default": "rules" },
         "x-automap-since": "1.1.0"
+      },
+      "Part": {
+        "name": "X-Automap-Part",
+        "in": "header",
+        "required": false,
+        "description": "Rules only: `N/M`, this push is part N of M parts of one site's rules (1 <= N <= M, 2 <= M <= 20), for a site too large for one scheduled job. Each part is a complete rules document pushed exactly like a plain push - its own chunks from seq 0, its own proof on its last chunk - and all parts of one build share the run id. The same value on every chunk of the part. The receiver merges the parts into one document once the last one is in (rules de-duplicated by uuid, the later part winning) and queues one build: the group is one load. Until then the last chunk of a part is answered `accepted`, not `queued`. A group not complete after 24 hours is abandoned and the next chunk 0 starts it over. Not allowed on usage or runs (400). Since receiver 2026-10-23, senders scriptrunner and jmwe 1.4.0.",
+        "schema": { "type": "string", "pattern": "^([1-9]\\d?)/([1-9]\\d?)$" },
+        "x-automap-since": "1.4.0"
       },
       "Sender": {
         "name": "X-Automap-Sender",

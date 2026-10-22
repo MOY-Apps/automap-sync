@@ -133,6 +133,7 @@ Content-Type: text/plain; charset=utf-8
 X-Automap-Run: <run id>
 X-Automap-Seq: <0, 1, 2, …>
 X-Automap-Sender: python/1.0.0               (our senders; see below)
+X-Automap-Part: 1/2                          (rules in parts only, on every chunk of the part; see "Parts")
 X-Automap-Last: 1                            (on the final chunk only)
 X-Automap-Sha256: <checksum>                 (final chunk: this, or X-Automap-Length, or both)
 X-Automap-Length: <length>                   (final chunk, for senders that cannot hash)
@@ -161,6 +162,43 @@ X-Automap-Length: <length>                   (final chunk, for senders that cann
 - **The final chunk** carries `X-Automap-Last: 1` and the checksum (or the length). The receiver joins the
   chunks, compares the SHA-256, and queues the build. From then the run is closed: any
   further request with that run id is `409 conflict` — start a new run.
+
+### Parts (receiver 2026-10-23)
+
+A scheduled job inside Jira has a time limit, and reading more than a few hundred rules
+one by one does not fit in it. So the rules may arrive in **parts**: several scheduled
+copies of the job (ScriptRunner and JMWE 1.4.0, `PART=1/2` and `PART=2/2`, an hour apart),
+each reading its share of the rules and pushing it as a complete rules document of its own,
+with `X-Automap-Part: N/M` on every chunk. The receiver merges the parts into the one
+document the build reads, and builds once.
+
+- **Each part is a push.** Its own chunks from seq 0, its own proof on its last chunk, the
+  same document shape - just fewer rules. A sender reuses its chunk code unchanged. `N/M`:
+  `1 <= N <= M`, `2 <= M <= 20`, identical on every chunk of the part; anything else is
+  `400 bad-request`, as is the header on usage or runs. `M` is the same on every part of
+  the group (`409 conflict` otherwise).
+- **One run id for the group.** Jobs that cannot talk to each other agree on it by the
+  date: our senders use `d<YYYYMMDD>` in UTC (`d20261023`). The receiver asks only that it
+  is a run id.
+- **Staged apart, built together.** Part N is staged under `push-<run>-p<N>`; chunk 0 of a
+  part clears that part - a resent part replaces itself. The group's `builds` row,
+  `push-<run>`, is opened by whichever part's chunk 0 comes first, and the load allowance is
+  checked there once: the parts are **one load**. A part for a group whose build is already
+  queued is `409 conflict`, as a reused run is.
+- **Answers.** The last chunk of a part is `202 accepted` while parts are missing, and
+  `202 queued` when it completed the group. Parts may come in any order. A part whose proof
+  fails is `422 checksum` and that part alone is dropped - the group and its other parts
+  stay, and the sender sends the part again from chunk 0; the build is not failed.
+- **The merge**, when the last missing part is in: the rules of every part in part order, a
+  rule carried by two parts kept once (the later part's copy - the job that ran later read
+  the newer rule; by `uuid`, or `id` without one), `sender` from the part that completed the
+  group, and `"parts": M` added. The document is written compact and ASCII under
+  `push-<run>` in chunks of 200 KB, the parts' chunks go, and the build is queued exactly
+  as for a plain push. The settings page says "in M parts".
+- **24 hours.** A group still staging a day after it opened was abandoned (the other job
+  never came): the next chunk 0 of any of its parts starts it over - the stale parts go,
+  the allowance is checked again, a new load. Nothing sweeps in the background; an
+  abandoned group costs nothing until a part comes.
 
 ### Answers
 
