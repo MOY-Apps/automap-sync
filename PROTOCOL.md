@@ -26,7 +26,10 @@ app. The app only ever sees a key it issued itself.
 ```
 
 The receiver side is described in `architecture.md` § "The push
-receiver"; this page is what a sender must do.
+receiver"; this page is what a sender must do. A customer writing a sender of their own
+reads the short reference, [`API.md`](API.md), with the OpenAPI spec
+[`openapi.json`](openapi.json), both next to the senders; a test in the app
+(`test/openapi.test.mjs`) holds both to the code.
 
 ## 1. What the administrator sets up
 
@@ -170,7 +173,7 @@ Atlassian). Read the **status code**; the `error` word separates the two 429s.
 | 200 | `alive` | — |
 | 202 | `{"accepted":true}` — chunk stored | send the next chunk |
 | 202 | `{"accepted":true,"queued":true}` — final chunk, checksum good, build queued | done; the map rebuilds in a minute or two |
-| 400 | `bad-request` — a header missing or malformed, empty or compressed body, `Last` without a checksum | fix the sender; do not retry as is |
+| 400 | `bad-request` — a header missing or malformed, `X-Automap-Seq` 400 or more (at most 400 chunks a run), empty or compressed body, `Last` without a checksum; for usage and runs also a joined body that is not JSON or not of its kind | fix the sender; do not retry as is |
 | 401 | `unauthorized` — no key, wrong key, revoked key | stop; the administrator makes a new key |
 | 402 | `inactive` — the subscription on this site has ended | stop |
 | 403 | `disabled` — this installation does not take pushes: switched off, or the site is on Basic, where the map loads from an export file only (remembered as `plan` on the settings page) | stop |
@@ -226,8 +229,9 @@ API token can read; Atlassian can change or close it without notice. So:
   the receiver keeps only the fields below whatever arrives.
 
 **Headers:** as any push, plus `X-Automap-Kind: usage`. Chunked like the rules (from senders
-1.2.0, APPS-499): `X-Automap-Seq` 0, 1, … in order, `X-Automap-Last: 1` and `X-Automap-Sha256`
-(or `X-Automap-Length`) on the last; a small site is one chunk. Every rule goes, none is
+1.2.0, ScriptRunner and JMWE 1.3.0, APPS-499): `X-Automap-Seq` 0, 1, … in order, `X-Automap-Last: 1` and `X-Automap-Sha256`
+(or `X-Automap-Length`) on the last; a small site is one chunk. One push of a kind at a time:
+chunk 0 of a push in several chunks clears whatever any run of that kind left staged. Every rule goes, none is
 dropped: Advanced keeps every rule Atlassian lists (10,000 at most). Answers: `202 accepted`
 for a chunk, `202 queued` for the last, `409 conflict` for a chunk out of order, `400
 bad-request` (not usage), `422 checksum`, and the key and rate answers of any push.
