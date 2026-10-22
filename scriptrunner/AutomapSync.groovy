@@ -35,9 +35,21 @@
  * Rarely needed: ATLASSIAN_CLOUD_ID (skips looking it up), AUTOMAP_CHUNK_BYTES (200000).
  *
  * Limits: a ScriptRunner Cloud script has a time limit per run. Reading a rule takes one
- * request, so a site with more than a few hundred rules may not finish in one run - use
- * the Python sender or the Docker image there. The job fails with a message starting
- * "[n]" where n is the exit code the other senders use (4 refused, 5 try later, 6 failed).
+ * request, so a site with more than a few hundred rules may not finish in one run - split
+ * the job (below) or use the Python sender or the Docker image. The job fails with a
+ * message starting "[n]" where n is the exit code the other senders use (2 a setting,
+ * 4 refused, 5 try later, 6 failed).
+ *
+ * MANY RULES: PART
+ *
+ * A site past the time limit runs this script as several Scheduled Jobs, each pushing a
+ * slice of the rules. Leave PART empty on a small site. To split in two: make two jobs
+ * with this script, an hour apart, with the same Script Variables except PART = 1/2 on
+ * the first and PART = 2/2 on the second. Each pushes its half; the map is built when
+ * the last half of the day has arrived. Three jobs are 1/3, 2/3, 3/3, up to 20. The
+ * limit is honest: each copy must finish within ScriptRunner's time limit; raise M until
+ * it does. The slices are cut by rule id, so a rule made between the two jobs may be
+ * missed until the next day.
  *
  * Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
  */
@@ -46,7 +58,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.3.0'
+final String VERSION = '1.4.0'
 final Set<Integer> REFUSED = [400, 401, 402, 403, 404, 405, 413, 426] as Set
 
 
@@ -72,6 +84,20 @@ def say = { String m ->
 
 
 boolean dryRun = lookup('AUTOMAP_DRY_RUN')?.toString() == '1'
+
+// PART = N/M: this job pushes the Nth of M slices of the rules (see the header); empty = all
+String partText = lookup('PART')?.toString()?.trim() ?: ''
+int partN = 0
+int partM = 0
+if (partText) {
+  def pm = partText =~ /^(\d{1,2})\/(\d{1,2})$/
+  if (pm.matches()) { partN = pm.group(1).toInteger(); partM = pm.group(2).toInteger() }
+  if (!pm.matches() || partM < 2 || partM > 20 || partN < 1 || partN > partM) {
+    throw new IllegalStateException("[2] PART must be N/M with 1 <= N <= M <= 20 (e.g. 1/2), or empty; got '${partText}'")
+  }
+}
+String part = partM ? "${partN}/${partM}".toString() : ''
+
 String auth = 'Basic ' + "${cfg('ATLASSIAN_EMAIL')}:${cfg('ATLASSIAN_API_TOKEN')}".bytes.encodeBase64().toString()
 String api = cfg('ATLASSIAN_API_BASE', 'https://api.atlassian.com').replaceAll('/$', '')
 
@@ -131,6 +157,16 @@ while (true) {
 }
 say("${ids.size()} rules listed in ${pages} page(s)")
 
+// the slice: the ids in string order, cut into M equal pieces, so every copy of the job
+// cuts the list the same way whatever order the API listed it in
+int total = ids.size()
+if (partM) {
+  ids = ids.sort(false)
+  int per = (int) Math.ceil(total / (double) partM)
+  ids = ids.subList(Math.min((partN - 1) * per, total), Math.min(partN * per, total))
+  say("part ${part}: ${ids.size()} of ${total} rules are this job's")
+}
+
 // each rule, wrapped in "rule"
 List<String> parts = []
 ids.each { id ->
@@ -159,14 +195,16 @@ def word = { String body -> try { new JsonSlurper().parseText(body ?: '{}').erro
 // the rules, in chunks: answers [code, say], which the end of the script turns into the outcome
 def pushRules = { ->
   if (dryRun) {
-    say("dry run: ${data.length} bytes in ${chunks.size()} chunk(s), sha256 ${sum}; nothing pushed")
+    say("dry run: ${part ? 'part ' + part + ', ' : ''}${data.length} bytes in ${chunks.size()} chunk(s), sha256 ${sum}; nothing pushed")
     return [0, 'dry run']
   }
   String url = cfg('AUTOMAP_URL')
   String key = cfg('AUTOMAP_KEY')
   for (int attempt = 1; attempt <= 2; attempt++) {
-    String run = UUID.randomUUID().toString().replace('-', '')
+    // parts of one day share the run: the UTC date, so independent jobs agree on it
+    String run = part ? 'd' + new Date().format('yyyyMMdd', TimeZone.getTimeZone('UTC')) : UUID.randomUUID().toString().replace('-', '')
     boolean restart = false
+    boolean queued = false
     for (int seq = 0; seq < chunks.size(); seq++) {
       Map<String, String> h = [
         'Authorization'   : "Bearer ${key}".toString(),
@@ -175,6 +213,7 @@ def pushRules = { ->
         'X-Automap-Seq'   : seq.toString(),
         'X-Automap-Sender': "${NAME}/${VERSION}".toString(),
       ]
+      if (part) h['X-Automap-Part'] = part
       if (seq == chunks.size() - 1) {
         h['X-Automap-Last'] = '1'
         h['X-Automap-Sha256'] = sum
@@ -191,8 +230,14 @@ def pushRules = { ->
         if (status == 202 || REFUSED.contains(status) || status in [409, 422, 429] || tries == 3) break
         Thread.sleep(1000L << tries)
       }
-      if (status == 202) continue
+      if (status == 202) {
+        if (seq == chunks.size() - 1) { try { queued = new JsonSlurper().parseText(r.body ?: '{}').queued == true } catch (Exception e) { queued = false } }
+        continue
+      }
       String w = word(r?.body)
+      // a part's run is the day's: a 409 means the map was built today already, or the
+      // other job was set up with another M, and sending again would not change that
+      if (status == 409 && part) return [4, "receiver answered 409 ${w}: today's map is already built, or another copy of this job has a different M in PART"]
       if ((status == 409 || status == 422) && attempt == 1) {
         say("receiver answered ${status} ${w}; starting the push again")
         restart = true
@@ -201,6 +246,11 @@ def pushRules = { ->
       if (status == 429) return [5, "receiver answered 429 ${w}: try again later"]
       if (REFUSED.contains(status)) return [4, "receiver refused the push: ${status} ${w}"]
       return [6, "receiver answered ${status} ${w}"]
+    }
+    if (!restart && part) {
+      String rest = partM == 2 ? 'part' : 'parts'
+      say("part ${part}: ${parts.size()} rules pushed, ${queued ? 'map queued' : 'waiting for the other ' + rest}")
+      return [0, "part ${part}: pushed ${chunks.size()} chunk(s)"]
     }
     if (!restart) {
       say("pushed ${data.length} bytes in ${chunks.size()} chunk(s); the map is rebuilding")

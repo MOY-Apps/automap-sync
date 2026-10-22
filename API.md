@@ -386,8 +386,9 @@ What each released version of our senders sends. The Docker image
 | 1.2.0 | scriptrunner, jmwe | as 1.1.0 on the wire; the rules and the usage and runs became two jobs |
 | 1.2.1 | scriptrunner, jmwe | as 1.2.0 on the wire; the usage job runs every hour over yesterday and today |
 | 1.3.0 | scriptrunner, jmwe | usage and runs in **chunks**, every rule (jmwe: chunks of 80,000 characters, proven by length) |
+| 1.4.0 | scriptrunner, jmwe | rules in parts (`PART=N/M`, `X-Automap-Part`), for sites past the host's time limit |
 
-Latest today: python, node, bash and powershell **1.2.0**; scriptrunner and jmwe **1.3.0**.
+Latest today: python, node, bash and powershell **1.2.0**; scriptrunner and jmwe **1.4.0**.
 The same list is in [`openapi.json`](openapi.json) under `x-automap-senders`.
 
 ### Old senders keep working

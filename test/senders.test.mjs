@@ -55,8 +55,14 @@ const SENDERS = [
     dryRunByEnv: true,
     // two Scheduled Jobs: the rules, and the usage and runs (beta), each with the whole time limit
     usageFile: 'AutomapUsage.groovy',
+    // the rules in parts (PART=N/M), for a site past the host's time limit
+    parts: true,
   },
 ];
+
+/** The run id the in-Jira senders use for parts: the UTC date, shared by every copy of the job. */
+const todayRun = () => `d${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
+const uuidsOf = (doc) => doc.rules.map((r) => r.rule.uuid);
 
 function dockerEnv(envv) {
   return Object.entries(envv).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
@@ -95,6 +101,53 @@ for (const s of SENDERS) {
       assert.ok(!out.includes(KEY) && !out.includes('atlassian-token-for-tests'), 'no secret in the log');
       assert.ok(!out.includes('Закрыть'), 'no rule content in the log');
       if (s.usageFile) assert.equal(site.state.usageCalls, 0, 'the rules script leaves usage and runs to the other one');
+      assert.ok(site.state.requests.every((r) => !r.part && !r.run.startsWith('d2')), 'without PART nothing changes on the wire');
+    } finally {
+      await site.close();
+    }
+  });
+
+  // the rules in parts (1.4.0): two scheduled copies of the job, PART=1/2 and 2/2, build one map
+  test(`${s.name}: PART=1/2 then 2/2 push two slices of one day's run, and the map has every rule`, { ...opts, skip: s.parts ? opts.skip : `${s.name}: has no PART` }, async () => {
+    const rules = makeRules(7);
+    const site = await startFakeSite({ rules, host });
+    try {
+      const first = await runSender(s, site, { PART: '1/2' });
+      assert.equal(first.code, 0, first.out);
+      assert.match(first.out, /part 1\/2: 4 rules pushed, waiting for the other part/);
+      assert.equal(site.state.loaded.length, 0, 'half the rules build nothing');
+      assert.equal(site.state.answers[site.state.answers.length - 1], 'accepted');
+
+      const second = await runSender(s, site, { PART: '2/2' });
+      assert.equal(second.code, 0, second.out);
+      assert.match(second.out, /part 2\/2: 3 rules pushed, map queued/);
+      assert.equal(site.state.answers[site.state.answers.length - 1], 'queued');
+      assert.equal(site.state.loaded.length, 1, second.out);
+      assert.deepEqual(new Set(uuidsOf(site.state.loaded[0])), new Set(rules.map((r) => r.uuid)), 'every rule, once');
+      assert.deepEqual([...site.state.senders], [`${s.name}/${versionOf(s.name)}`]);
+
+      // one run for the day, the header on every chunk, the slices cut by sorted uuid without overlap
+      const run = todayRun();
+      assert.ok(site.state.requests.every((r) => r.run === run && /^[12]\/2$/.test(r.part)), JSON.stringify(site.state.requests));
+      const group = site.state.partRuns.get(run);
+      const sorted = rules.map((r) => r.uuid).sort();
+      assert.deepEqual(uuidsOf(group.done.get(1)), sorted.slice(0, 4));
+      assert.deepEqual(uuidsOf(group.done.get(2)), sorted.slice(4));
+
+      // the same part again today: the run is built, and the sender says so instead of retrying
+      const again = await runSender(s, site, { PART: '1/2' });
+      assert.equal(again.code, 4, again.out);
+      assert.match(again.out, /already built/);
+      assert.equal(site.state.loaded.length, 1);
+
+      // a bad PART is a configuration error, found before anything is read
+      for (const bad of ['2/1', 'x', '1/1', '0/2', '1/21', '1/2/3']) {
+        const calls = site.state.apiCalls.length;
+        const r = await runSender(s, site, { PART: bad });
+        assert.equal(r.code, 2, `PART=${bad}: ${r.out}`);
+        assert.match(r.out, /PART must be/);
+        assert.equal(site.state.apiCalls.length, calls, `PART=${bad}: nothing read`);
+      }
     } finally {
       await site.close();
     }
@@ -258,5 +311,57 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
   } finally {
     await site.close();
     await broken.close();
+  }
+});
+
+// the rules in parts (1.4.0): two Scheduled actions, PART = "1/2" and "2/2", build one map
+test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map has every rule', { skip: nunjucksDir ? false : 'jmwe: set NUNJUCKS_DIR to a folder with nunjucks installed', timeout: 240_000 }, async () => {
+  const rules = makeRules(7);
+  const site = await startFakeSite({ rules, flaky: false });
+  try {
+    const first = await runJmwe(site, { PART: '1/2' });
+    assert.equal(first.code, 0, first.out);
+    assert.match(first.out, /part 1\/2: 4 rules pushed, waiting for the other part/);
+    assert.equal(site.state.loaded.length, 0, 'half the rules build nothing');
+    assert.equal(site.state.answers[site.state.answers.length - 1], 'accepted');
+
+    const second = await runJmwe(site, { PART: '2/2' });
+    assert.equal(second.code, 0, second.out);
+    assert.match(second.out, /part 2\/2: 3 rules pushed, map queued/);
+    assert.equal(site.state.answers[site.state.answers.length - 1], 'queued');
+    assert.equal(site.state.loaded.length, 1, second.out);
+    assert.deepEqual(new Set(uuidsOf(site.state.loaded[0])), new Set(rules.map((r) => r.uuid)), 'every rule, once');
+    assert.deepEqual([...site.state.senders], ['jmwe/1.4.0']);
+
+    const run = todayRun();
+    assert.ok(site.state.requests.every((r) => r.run === run && /^[12]\/2$/.test(r.part)), JSON.stringify(site.state.requests));
+    assert.ok(site.state.requests.length > 2, 'small chunks mean several requests per part');
+    const group = site.state.partRuns.get(run);
+    const sorted = rules.map((r) => r.uuid).sort();
+    assert.deepEqual(uuidsOf(group.done.get(1)), sorted.slice(0, 4));
+    assert.deepEqual(uuidsOf(group.done.get(2)), sorted.slice(4));
+
+    // the same part again today: 409, said plainly in the result line
+    const again = await runJmwe(site, { PART: '1/2' });
+    assert.match(again.out, /HTTP 409 \(today's map is already built/);
+    assert.equal(site.state.loaded.length, 1);
+
+    // a bad PART is a configuration error, found before anything is read
+    for (const bad of ['2/1', 'x', '1/1', '0/2', '1/21', '1/2/3']) {
+      const calls = site.state.apiCalls.length;
+      const r = await runJmwe(site, { PART: bad });
+      assert.match(r.out, /^automap-sync jmwe 1\.4\.0: failed - \[2\] PART must be/, `PART=${bad}: ${r.out}`);
+      assert.equal(site.state.apiCalls.length, calls, `PART=${bad}: nothing read`);
+    }
+    // without PART nothing changes on the wire
+    const plain = await startFakeSite({ rules: makeRules(3), flaky: false });
+    try {
+      assert.equal((await runJmwe(plain)).code, 0);
+      assert.ok(plain.state.requests.every((r) => !r.part && r.run.startsWith('jmwe-')), JSON.stringify(plain.state.requests));
+    } finally {
+      await plain.close();
+    }
+  } finally {
+    await site.close();
   }
 });

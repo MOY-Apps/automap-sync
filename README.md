@@ -33,6 +33,7 @@ All of them read the same settings, send the same thing and exit the same way.
 | `AUTOMAP_URL` | Jira settings → Apps → Automation Map → Data → *Push from your side* → **Set up**: the guide shows the receiver URL |
 | `AUTOMAP_KEY` | the same guide makes it the moment a tool is picked, and shows it once |
 | `AUTOMAP_CHUNK_BYTES` | optional, default `200000` |
+| `PART` | ScriptRunner and JMWE only (1.4.0), optional: `1/2` and `2/2` on two scheduled copies of the rules job, each pushing its slice; for a site past the host's time limit. Empty = all in one |
 
 `--dry-run` (PowerShell: `-DryRun`; ScriptRunner: `AUTOMAP_DRY_RUN=1`) reads everything and
 pushes nothing — a safe first test of the Atlassian side.
