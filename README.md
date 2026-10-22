@@ -51,7 +51,8 @@ fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=of
 `RUNS`. Inside Jira they are a job of their own (`AutomapUsage.groovy`, `automap-usage.njk`),
 so the rules job keeps the host's whole time limit. ScriptRunner reads the audit log only while its run has time left, and JMWE reads
 at most `RUNS_MAX_PAGES` pages of it: past that the runs are skipped, not sent in part, and
-`AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix.
+`AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix. Inside Jira the default is 1 (yesterday and today)
+and the usage job runs every hour: each run is short, and the map keeps 35 days of what they bring.
 
 ## Exit codes
 
@@ -78,8 +79,8 @@ gets exit 5.
 - **Kubernetes** — [`ci/kubernetes-cronjob.yml`](ci/kubernetes-cronjob.yml)
 - **cron** — `17 3 * * * docker run --rm --pull always --env-file /etc/automap-sync.env ghcr.io/moy-apps/automap-sync:1`
 - **Windows** — Task Scheduler: `pwsh -NoProfile -File C:\automap\automap-sync.ps1`, with the variables set for the task's account
-- **ScriptRunner** — two Scheduled Jobs, daily: `AutomapSync.groovy` (the rules) and `AutomapUsage.groovy` (usage and runs, may run every few hours), the variables in Script Variables, shared
-- **JMWE** — two Scheduled actions on one anchor work item: `automap-sync.njk` and `automap-usage.njk`, both filled with the same values
+- **ScriptRunner** — two Scheduled Jobs: `AutomapSync.groovy` (the rules) daily, `AutomapUsage.groovy` (usage and runs) every hour; the variables in Script Variables, shared
+- **JMWE** — two Scheduled actions on one anchor work item: `automap-sync.njk` and `automap-usage.njk`, both filled with the same values; the usage one every hour
 
 ## Updates
 

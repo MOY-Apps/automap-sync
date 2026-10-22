@@ -5,8 +5,8 @@
 
   A Nunjucks template for JMWE's "Build-your-own (scripted) post-function", run by a
   Scheduled action whose JQL matches ONE anchor work item (e.g. key = OPS-1). A usage push
-  spends no load of the map, so the action may run more often than the rules one: every
-  few hours is fine. Fill the same five values as in automap-sync.njk.
+  spends no load of the map, so run it every hour: each run reads only yesterday and today
+  (RUNS_DAYS = 1), which fits a JMWE action on any site, and the map keeps 35 days. Fill the same five values as in automap-sync.njk.
 
   Reads this month's steps, Rovo credits and flow runs per rule, and the audit log of the
   last RUNS_DAYS days folded into per-rule, per-day counts, from the internal API behind
@@ -29,12 +29,12 @@
 {%- set KEY = "the amk_ key from Automation Map" -%}
 {%- set USAGE = true -%}
 {%- set RUNS = true -%}
-{%- set RUNS_DAYS = 7 -%}
+{%- set RUNS_DAYS = 1 -%}
 {%- set RUNS_MAX_PAGES = 60 -%}
 
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.2.0" -%}
+{%- set VERSION = "1.2.1" -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
 {%- set failures = [] -%}
@@ -279,7 +279,7 @@
     {%- set doc = '{"runs":{"window":' + ({ "start": startMs, "end": nowMs } | dump) + ',"rows":[' + rowsJson.join(",") + '],"errors":' + (errs | dump)
         + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
     {%- set said = "" + (pushKind("runs", doc) | trim) -%}
-    {%- set _ = notes.push(("runs (beta): not taken, receiver answered " + said) if said else ("runs (beta) last " + days + " days: pushed " + totals[0] + " runs, " + totals[1] + " with errors")) -%}
+    {%- set _ = notes.push(("runs (beta): not taken, receiver answered " + said) if said else ("runs (beta) " + ("yesterday and today" if days == 1 else "last " + days + " days") + ": pushed " + totals[0] + " runs, " + totals[1] + " with errors")) -%}
   {%- endif -%}
 {%- endif -%}
 automap-sync {{ NAME }} {{ VERSION }} usage: {{ notes.join("; ") if notes.length else "nothing to do: USAGE and RUNS are both false" }}

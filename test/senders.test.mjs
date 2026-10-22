@@ -159,7 +159,14 @@ for (const s of SENDERS) {
     assert.deepEqual(r.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
     const sent = JSON.stringify(site.state.pushed.runs);
     assert.ok(!sent.includes('secret-') && !sent.includes('10042'), 'no message text, no parameters, no work item ids');
-    assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
+    // inside Jira the usage job runs every hour over yesterday and today; the map keeps 35 days
+    if (s.usageFile) {
+      assert.match(out, /runs \(beta\) yesterday and today: pushed 3 runs, 1 with errors/);
+      const y = new Date(); y.setUTCHours(0, 0, 0, 0);
+      assert.equal(r.window.start, y.getTime() - 86400000, 'the window starts yesterday 00:00 UTC');
+    } else {
+      assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
+    }
 
     // the internal API gone: the rules still go, the run still succeeds
     const gone = await runBoth(broken);
@@ -226,7 +233,9 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     assert.deepEqual(r.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
     const sent = JSON.stringify(site.state.pushed.runs);
     assert.ok(!sent.includes('secret-') && !sent.includes('10042'), 'no message text, no parameters, no work item ids');
-    assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
+    assert.match(out, /runs \(beta\) yesterday and today: pushed 3 runs, 1 with errors/);
+    const y0 = new Date(); y0.setUTCHours(0, 0, 0, 0);
+    assert.equal(r.window.start, y0.getTime() - 86400000, 'the window starts yesterday 00:00 UTC');
     // the day each run is filed under is the UTC day, worked out without a date library
     const today = new Date().toISOString().slice(0, 10);
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);

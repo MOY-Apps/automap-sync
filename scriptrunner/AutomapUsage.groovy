@@ -8,14 +8,16 @@
  * folded into per-rule, per-day counts, from the internal API behind Jira's Usage and Audit
  * log tabs, and pushes them as two separate pushes. That API is undocumented and can
  * change: a failure there is logged and never fails the job. No account ids, no issue ids
- * and no message text leave the job. A usage push spends no load of the map, so the job may
- * run more often than the rules: every few hours is fine.
+ * and no message text leave the job. A usage push spends no load of the map, so schedule
+ * this job every hour: each run reads only yesterday and today, which fits ScriptRunner's
+ * time limit on any site, and the map keeps 35 days of what the runs bring.
  *
  * SETUP: the Script Variables of AutomapSync.groovy, nothing more. Script Console: Run to
  * try it (AUTOMAP_DRY_RUN = 1 reads and sends nothing); then Scheduled Jobs -> Create, run as
- * a Jira administrator, once a day or every few hours, and paste this script.
+ * a Jira administrator, every hour, and paste this script.
  *
- * Rarely needed: AUTOMAP_USAGE = off, AUTOMAP_RUNS = off, AUTOMAP_RUNS_DAYS (7),
+ * Rarely needed: AUTOMAP_USAGE = off, AUTOMAP_RUNS = off, AUTOMAP_RUNS_DAYS (1: yesterday and
+ * today; more days only for a one-off backfill),
  * ATLASSIAN_CLOUD_ID.
  *
  * Limits: the audit log is read only while the run has time left (200 s); if it does not
@@ -28,7 +30,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.2.0'
+final String VERSION = '1.2.1'
 final long STARTED = System.currentTimeMillis()
 // ScriptRunner Cloud stops a script after a few minutes; the runs (beta) are read only
 // while there is time left, and skipped rather than sent in part when there is not
@@ -201,7 +203,8 @@ def pushRuns = { ->
   if (runsOff) return
   if (shut[0]) { say('runs (beta) skipped: the map does not take them (403)'); return }
   try {
-    int days = 7
+    // yesterday and today: an hourly job keeps the map's 35 days filled without a long run
+    int days = 1
     String d = lookup('AUTOMAP_RUNS_DAYS')?.toString()
     if (d?.isInteger()) days = Math.max(1, Math.min(30, d.toInteger()))
     long nowMs = System.currentTimeMillis()
@@ -274,9 +277,10 @@ def pushRuns = { ->
     }
     int total = runs.rows.sum(0) { it.success + it.errors + it.noop }
     int bad = runs.rows.sum(0) { it.errors }
-    if (dryRun) { say("runs (beta) last ${days} days: ${total} runs, ${bad} with errors; nothing pushed"); return }
+    String span = days == 1 ? 'yesterday and today' : "last ${days} days"
+    if (dryRun) { say("runs (beta) ${span}: ${total} runs, ${bad} with errors; nothing pushed"); return }
     def r = pushKind('runs', text)
-    if (r.status == 202) say("runs (beta) last ${days} days: pushed ${total} runs, ${bad} with errors")
+    if (r.status == 202) say("runs (beta) ${span}: pushed ${total} runs, ${bad} with errors")
     else say("runs (beta): not taken, receiver answered ${r.status} ${word(r.body)}")
   } catch (Exception e) {
     say("runs (beta) skipped: ${e.message}")
