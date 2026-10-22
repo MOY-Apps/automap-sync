@@ -27,8 +27,9 @@ app. The app only ever sees a key it issued itself.
 
 The receiver side is described in `architecture.md` § "The push
 receiver"; this page is what a sender must do. A customer writing a sender of their own
-reads the short reference, [`senders/API.md`](API.md), with the OpenAPI spec
-[`senders/openapi.json`](openapi.json); `test/openapi.test.mjs` holds both to the code.
+reads the short reference, [`API.md`](API.md), with the OpenAPI spec
+[`openapi.json`](openapi.json), both next to the senders; a test in the app
+(`test/openapi.test.mjs`) holds both to the code.
 
 ## 1. What the administrator sets up
 

@@ -38,7 +38,7 @@ curl -sS "${URL%/push}"
 
 ```bash
 BODY='{"rules":[]}'
-SUM=$(printf '%s' "$BODY" | shasum -a 256 | cut -d' ' -f1)
+SUM=$(printf '%s' "$BODY" | shasum -a 256 | cut -d' ' -f1)   # or sha256sum
 curl -sS -X POST "$URL" \
   -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: text/plain; charset=utf-8' \
@@ -80,7 +80,8 @@ Use an Atlassian API token **with the Automation scope**, for a Jira administrat
 1. Cloud id: `GET https://<your-site>.atlassian.net/_edge/tenant_info` → `cloudId`.
 2. Rule list, paged:
    `GET https://api.atlassian.com/automation/public/jira/<cloudId>/rest/v1/rule/summary?limit=100`.
-   Follow `links.next` (its `cursor` parameter) until there is none.
+   The rules are in `data`, each with its `uuid` (or `id`). Follow `links.next` (its
+   `cursor` parameter) until there is none.
 3. Each rule: `GET https://api.atlassian.com/automation/public/jira/<cloudId>/rest/v1/rule/<uuid>`.
    The answer is the rule, bare or wrapped in `rule`.
 4. On 429 or 5xx, wait `Retry-After` seconds (or 1 s, doubling up to 15 s) and retry, up to
@@ -103,11 +104,12 @@ The token goes only to Atlassian. Never send it to the receiver.
 
 ### 3. Serialise
 
-- **Compact JSON**: no indentation, no line breaks. The platform removes line breaks from a
-  request body.
+- **Compact JSON**: no indentation, no line breaks, no newline at the end. The platform
+  removes line breaks from a request body, and the hash would no longer match.
 - **Escape to ASCII**: write every non-ASCII character as `\uXXXX` (an emoji is two). Then one
-  character is one byte, and a split by bytes is always safe. Python's `json.dumps` does
-  this by default; `jq -a` does it.
+  character is one byte, and a split by bytes is always safe. Python:
+  `json.dumps(doc, separators=(",", ":"))` (ASCII by default). jq: `jq -acj` (`-a` ASCII,
+  `-c` compact, `-j` no newline at the end; without `-c` and `-j` the push fails `422`).
 - If you cannot escape, send UTF-8 and split on character boundaries, never between the two
   halves of a UTF-16 surrogate pair.
 
@@ -135,7 +137,7 @@ Content-Type: text/plain; charset=utf-8
 X-Automap-Run: <run id>
 X-Automap-Seq: <0, 1, 2, ...>
 X-Automap-Kind: rules                (or usage, or runs; leave out for rules)
-X-Automap-Sender: acme-sync/1.0.0    (optional; see "Identify your sender")
+X-Automap-Sender: acmesync/1.0.0     (optional; see "Identify your sender")
 ```
 
 - And on the **last** chunk only:
@@ -158,7 +160,8 @@ See [Answers](#answers). In short:
 - `500 failed`, or no answer at all: send the **same** chunk again, with a backoff. Resending
   a chunk replaces the copy already received, so it is always safe.
 - `409 conflict` or `422 checksum`: start again with a **new run id** from chunk 0. Do this
-  once; if it fails again, stop and report.
+  once; if it fails again, stop and report. A `409` on a *resent* last chunk of rules can mean
+  the first copy arrived: the push is done, and a new run would spend a second load.
 - `429`: stop and try later.
 - Anything else: stop and report. Sending the same request again will not help.
 
@@ -187,7 +190,7 @@ To save loads, keep the last checksum and skip the rules push when it has not ch
 | Header | On | Value | Since |
 |---|---|---|---|
 | `Authorization` | every chunk | `Bearer <push-key>` | 1.0.0 |
-| `X-Automap-Key` | every chunk | `<push-key>`, instead of `Authorization`; wins if both are sent | 1.0.0 |
+| `X-Automap-Key` | every chunk | `<push-key>`, instead of `Authorization`; wins if both are sent | 1.0.0 (taken; our senders send `Authorization`) |
 | `X-Automap-Run` | every chunk, required | 8 to 64 of `A-Z a-z 0-9 _ -`, new per push | 1.0.0 |
 | `X-Automap-Seq` | every chunk, required | `0` to `399`, in order | 1.0.0 |
 | `X-Automap-Last` | last chunk | `1` (or `true`). Any other value means more follow | 1.0.0 |
@@ -275,7 +278,7 @@ and codes only: no work-item ids, no message text, no account ids.
 | `window.start`, `window.end` | Unix ms, end not before start, at most 31 days apart. Otherwise the push is a `400` |
 | `rows[]` | one per rule and UTC day (`day` is `YYYY-MM-DD`). `success`, `errors`, `noop` (did nothing), `edits` (rule edits, not runs), `ms` (total time), `maxMs` (longest run). First 20,000 kept |
 | `rows[].hours` | optional, sparse: runs per UTC hour, keys `0` to `23`, only hours that had any |
-| `errors[]` | failed components of failed runs: `componentId`, `componentType`, `type`, `code` (the error's i18n key or code), `at` (Unix ms). First 500 kept; the app keeps the 5 newest per rule |
+| `errors[]` | failed components of failed runs: `uuid` (the rule; an entry without one is dropped), `componentId`, `componentType`, `type`, `code` (the error's i18n key or code), `at` (Unix ms). First 500 kept; the app keeps the 5 newest per rule |
 
 The days the window covers replace what the app had for them. Other days are kept, 35 days
 back.
