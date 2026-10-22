@@ -357,6 +357,23 @@ Every shape any released sender has sent is still accepted, and will be:
 A new feature may need a newer sender to *use* it. It never stops an older one from doing
 what it did. So a sender you write against this page keeps working.
 
+### The protocol version is the path
+
+The version of the receiver you push to is in the URL: `/v1/push` (`GET /v1` answers
+`"protocol":"v1"`). You do not send it in a header.
+
+- `v1` only grows: new optional headers, kinds and answers. Nothing that works on `v1`
+  today stops working on `v1`.
+- A change that old senders could not follow ships as a **new path**, `/v2/push`, next to
+  `/v1`. Both are taken at the same time, and this page describes both.
+- `v1` is switched off only on a date announced at least **3 months** ahead: on this page,
+  in the app's settings, and in the receiver's answers to `v1` pushes. After that date `v1`
+  answers `426 upgrade` with what to change. No such date is set today.
+
+So write your sender against one path and keep the path in its configuration (the receiver
+URL is a setting in all of ours). Moving to `v2` is then a new URL plus the changes `v2`
+lists, not a guess.
+
 ### Identify your sender
 
 `X-Automap-Sender: <name>/<major>.<minor>.<patch>` is optional. The name is 2 to 20
