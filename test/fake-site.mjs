@@ -204,8 +204,9 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       const last = h('x-automap-last') === '1' || h('x-automap-last') === 'true';
       const sum = String(h('x-automap-sha256') || '').toLowerCase();
       const lengthText = String(h('x-automap-length') || '');
+      const partText = String(h('x-automap-part') || '');
       state.requests = state.requests || [];
-      state.requests.push({ run, seq: h('x-automap-seq'), last: h('x-automap-last'), length: lengthText, sha: sum, bytes: raw.length, sender: h('x-automap-sender') });
+      state.requests.push({ run, seq: h('x-automap-seq'), last: h('x-automap-last'), length: lengthText, sha: sum, bytes: raw.length, sender: h('x-automap-sender'), part: partText });
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(run) || !Number.isInteger(seq) || seq < 0) return answer('bad-request');
       // like the real receiver: the last chunk proves the payload by SHA-256, by length, or both
       if (last && !/^[0-9a-f]{64}$/.test(sum) && !/^\d{1,10}$/.test(lengthText)) return answer('bad-request');
@@ -230,6 +231,55 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
         if (sum && createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
         if (lengthText && whole.toString('utf8').length !== Number(lengthText)) return answer('checksum');
         state.pushed[kind].push(JSON.parse(whole.toString('utf8')));
+        return answer('queued');
+      }
+
+      // rules in parts (X-Automap-Part: N/M, senders 1.4.0): the parts of one run are staged
+      // apart, each proven by its own last chunk, and merged by uuid into one build once all
+      // M have arrived. Another M for the same run, or a run already built, is a conflict.
+      if (partText) {
+        const pm = /^(\d{1,2})\/(\d{1,2})$/.exec(partText);
+        const n = pm ? Number(pm[1]) : 0;
+        const m = pm ? Number(pm[2]) : 0;
+        if (!pm || m < 2 || m > 20 || n < 1 || n > m) return answer('bad-request');
+        state.partRuns = state.partRuns || new Map();
+        let group = state.partRuns.get(run);
+        if (group && (group.built || group.m !== m)) return answer('conflict');
+        if (!group) {
+          group = { m, staging: new Map(), done: new Map(), built: false };
+          state.partRuns.set(run, group);
+        }
+        let piece = group.staging.get(n);
+        if (seq === 0) {
+          piece = { parts: [] };
+          group.staging.set(n, piece);
+        } else if (!piece || seq > piece.parts.length) {
+          return answer('conflict');
+        }
+        if (seq === 1 && flaky && !tripped500) {
+          tripped500 = true;
+          return answer('failed');
+        }
+        piece.parts[seq] = raw;
+        if (!last) return answer('accepted');
+        if (piece.parts.length !== seq + 1) return answer('conflict');
+        const whole = Buffer.concat(piece.parts);
+        group.staging.delete(n);
+        if (sum && createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
+        if (lengthText && whole.toString('utf8').length !== Number(lengthText)) return answer('checksum');
+        group.done.set(n, JSON.parse(whole.toString('utf8')));
+        if (group.done.size < m) return answer('accepted');
+        const seenIds = new Set();
+        const merged = [];
+        for (let i = 1; i <= m; i += 1) {
+          for (const r of group.done.get(i).rules) {
+            const id = r.rule && r.rule.uuid;
+            if (!id || !seenIds.has(id)) merged.push(r);
+            if (id) seenIds.add(id);
+          }
+        }
+        group.built = true;
+        state.loaded.push({ rules: merged, sender: group.done.get(m).sender, parts: m });
         return answer('queued');
       }
 

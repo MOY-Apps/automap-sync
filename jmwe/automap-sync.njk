@@ -15,7 +15,13 @@
   at most 240 KB of UTF-8, under the receiver's 256 KiB.
 
   Each rule is one request; a site with many hundreds of rules may run longer than a
-  JMWE action is allowed to - use another sender there.
+  JMWE action is allowed to. Such a site runs this template as several Scheduled actions,
+  each pushing a slice of the rules: PART. Leave it "" on a small site. To split in two,
+  make two actions an hour apart with the same values except PART = "1/2" in the first
+  and "2/2" in the second; each pushes its half, and the map is built when the last half
+  of the day has arrived. Three are "1/3", "2/3", "3/3", up to 20. The limit is honest:
+  each copy must finish within JMWE's time limit; raise M until it does. The slices are
+  cut by rule id, so a rule made between the two actions may be missed until the next day.
 
   This is the first of two templates. automap-usage.njk, a Scheduled action of its own,
   pushes this month's usage and the audit log (beta, Advanced edition), so each gets a
@@ -30,12 +36,23 @@
 {%- set TOKEN = "an API token with the Automation scope" -%}
 {%- set PUSH_URL = "the receiver URL from Automation Map, ending /v1/push" -%}
 {%- set KEY = "the amk_ key from Automation Map" -%}
+{%- set PART = "" -%}
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.3.0" -%}
+{%- set VERSION = "1.4.0" -%}
 {%- set CHUNK = 80000 -%}
 {%- set MAX_PAGES = 100 -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
+
+{#- PART = "N/M", 1 <= N <= M <= 20, or ""; a bad value stops the action before it reads anything -#}
+{%- set pp = (PART | trim).split("/") if PART else [] -%}
+{%- set partN = (pp[0] | int) if pp.length == 2 else 0 -%}
+{%- set partM = (pp[1] | int) if pp.length == 2 else 0 -%}
+{%- set partOk = (not PART) or (pp.length == 2 and ("" + partN) == pp[0] and ("" + partM) == pp[1] and partM >= 2 and partM <= 20 and partN >= 1 and partN <= partM) -%}
+{%- set part = (partN + "/" + partM) if (partOk and PART) else "" -%}
+{%- if not partOk -%}
+automap-sync {{ NAME }} {{ VERSION }}: failed - [2] PART must be "N/M" with 1 <= N <= M <= 20 (e.g. "1/2"), or "", not "{{ PART }}"
+{%- else -%}
 
 {#- 1. the cloud id, then every rule id, page by page -#}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
@@ -55,6 +72,15 @@
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
+
+{#- the slice: the ids in string order, cut into M equal pieces, so every copy of the action
+    cuts the list the same way whatever order the API listed it in -#}
+{%- set total = ids.length -%}
+{%- if part -%}
+  {%- set _ = ids.sort() -%}
+  {%- set per = (total + partM - 1) // partM -%}
+  {%- set ids = ids.slice((partN - 1) * per, partN * per) -%}
+{%- endif -%}
 
 {#- 2. each rule, wrapped in "rule", as compact JSON -#}
 {%- set parts = [] -%}
@@ -76,14 +102,31 @@
   {%- endif -%}
 {%- endfor -%}
 
-{#- 4. push: one run id, chunks in order, the length on the last one -#}
-{%- set run = NAME + "-" + text.length + "-" + ids.length + "-" + (now | date("x") if now else "0") -%}
+{#- 4. push: one run id, chunks in order, the length on the last one. Parts of one day share
+    the run: the UTC date, worked out from the clock without a date library -#}
+{%- macro ymd(days) -%}
+{%- set z = days + 719468 -%}
+{%- set era = z // 146097 -%}
+{%- set doe = z - era * 146097 -%}
+{%- set yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365 -%}
+{%- set doy = doe - (365 * yoe + yoe // 4 - yoe // 100) -%}
+{%- set mp = (5 * doy + 2) // 153 -%}
+{%- set dd = doy - (153 * mp + 2) // 5 + 1 -%}
+{%- set mm = (mp + 3) if mp < 10 else (mp - 9) -%}
+{%- set yy = yoe + era * 400 + (1 if mm <= 2 else 0) -%}
+{{- yy }}{{ ("0" if mm < 10 else "") + mm }}{{ ("0" if dd < 10 else "") + dd -}}
+{%- endmacro -%}
+{%- set nowMs = (now | date("x") if now else "0") | int -%}
+{%- set run = ("d" + (ymd(nowMs // 86400000) | trim)) if part else (NAME + "-" + text.length + "-" + ids.length + "-" + nowMs) -%}
 {%- set failures = [] -%}
+{%- set queued = [] -%}
 {%- set count = bounds.length - 1 -%}
 {#- JMWE's range() includes its end (checked live: range(0, 8) reached 8), the standard
     one does not; the guard makes both send exactly `count` chunks -#}
 {%- for i in range(0, count) -%}
   {%- if failures.length == 0 and i < count -%}
+    {#- a map cannot be added to in Nunjucks, so each shape of the headers is written out:
+        X-Automap-Part on every chunk of a part, Last and Length on the last chunk -#}
     {%- set headers = {
       "Authorization": "Bearer " + KEY,
       "Content-Type": "text/plain; charset=utf-8",
@@ -91,7 +134,17 @@
       "X-Automap-Seq": "" + i,
       "X-Automap-Sender": NAME + "/" + VERSION
     } -%}
-    {%- if i == count - 1 -%}
+    {%- if part -%}
+      {%- set headers = {
+        "Authorization": "Bearer " + KEY,
+        "Content-Type": "text/plain; charset=utf-8",
+        "X-Automap-Run": run,
+        "X-Automap-Seq": "" + i,
+        "X-Automap-Sender": NAME + "/" + VERSION,
+        "X-Automap-Part": part
+      } -%}
+    {%- endif -%}
+    {%- if i == count - 1 and not part -%}
       {%- set headers = {
         "Authorization": "Bearer " + KEY,
         "Content-Type": "text/plain; charset=utf-8",
@@ -102,10 +155,29 @@
         "X-Automap-Length": "" + text.length
       } -%}
     {%- endif -%}
+    {%- if i == count - 1 and part -%}
+      {%- set headers = {
+        "Authorization": "Bearer " + KEY,
+        "Content-Type": "text/plain; charset=utf-8",
+        "X-Automap-Run": run,
+        "X-Automap-Seq": "" + i,
+        "X-Automap-Sender": NAME + "/" + VERSION,
+        "X-Automap-Part": part,
+        "X-Automap-Last": "1",
+        "X-Automap-Length": "" + text.length
+      } -%}
+    {%- endif -%}
     {%- set res = PUSH_URL | callRest(verb="post", body=text.slice(bounds[i], bounds[i + 1]), noJSON=true, dontFail=true, options={ "headers": headers, "timeout": 60000 }) -%}
     {%- if res._statusCode -%}
-      {%- set _ = failures.push("chunk " + i + ": HTTP " + res._statusCode) -%}
+      {#- a part's run is the day's: 409 means the map was built today already, or the other
+          action has another M; 422 means this part's proof failed - run it again -#}
+      {%- set _ = failures.push("chunk " + i + ": HTTP " + res._statusCode
+          + (" (today's map is already built, or another copy of this action has a different M in PART)" if (part and res._statusCode == 409)
+          else (" (this part did not arrive whole; run the action again)" if (part and res._statusCode == 422) else ""))) -%}
+    {%- elif i == count - 1 and ("" + res).indexOf('"queued":true') >= 0 -%}
+      {%- set _ = queued.push(1) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-automap-sync {{ NAME }} {{ VERSION }}: {{ ids.length }} rules, {{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else "pushed, the map is rebuilding" }}
+automap-sync {{ NAME }} {{ VERSION }}: {{ ("part " + part + ": " + ids.length + " of " + total + " rules, ") if part else (ids.length + " rules, ") }}{{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else (("part " + part + ": " + ids.length + " rules pushed, " + ("map queued" if queued.length else ("waiting for the other " + ("part" if partM == 2 else "parts")))) if part else "pushed, the map is rebuilding") }}
+{%- endif -%}
