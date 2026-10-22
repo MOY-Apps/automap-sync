@@ -1,0 +1,588 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Automation Map push API",
+    "version": "v1",
+    "summary": "Push your Jira automation rules, usage and runs to Automation Map for Jira.",
+    "description": "The receiver of Automation Map for Jira. A sender that you run reads your automation rules (and, optionally, usage and runs) with your own Atlassian API token and pushes them here. The token never reaches the app; the app sees only a key it issued (`amk_...`).\n\nThe guide is API.md next to this file. The full contract, with the reasons behind it, is PROTOCOL.md.\n\nEvery answer is one of a fixed set of bodies declared in the app's manifest. The receiver cannot put anything else in an answer: no counts, no ids, no error text. Read the status code; the `error` word tells the two 429 answers apart. What happened after a push (loaded, refused as another site's, failed) is shown on the app's settings page, not in the answer.\n\nPushes are part of the Advanced edition. On Basic (sold as Standard) every push, of any kind, is answered `403 disabled`.",
+    "license": {
+      "name": "Source-available, usable only with Automation Map for Jira",
+      "url": "https://github.com/MOY-Apps/automap-sync/blob/main/LICENSE"
+    }
+  },
+  "servers": [
+    {
+      "url": "{receiver}",
+      "description": "Your installation's receiver. In Jira: Settings, Apps, Automation Map, Data, Push from your side, Set up. The guide shows a URL ending in /v1/push; `receiver` is that URL without /v1/push.",
+      "variables": {
+        "receiver": {
+          "default": "https://your-receiver-url-from-the-settings-page",
+          "description": "The web trigger URL of your installation, without the trailing /v1/push. Per installation; not secret."
+        }
+      }
+    }
+  ],
+  "security": [
+    { "bearer": [] },
+    { "automapKey": [] }
+  ],
+  "x-automap-limits": {
+    "maxChunkBytes": 262144,
+    "recommendedChunkBytes": 200000,
+    "maxChunks": 400,
+    "rateLimit": 300,
+    "rateWindowSeconds": 600,
+    "maxFlows": 10000,
+    "runsMaxRows": 20000,
+    "runsMaxErrors": 500,
+    "runsMaxWindowDays": 31,
+    "runsKeepDays": 35,
+    "description": "maxChunkBytes: one request body, in UTF-8 bytes (413 above it). recommendedChunkBytes: what the published senders send; the platform fails bodies near 800 KB before the app runs. maxChunks: chunks in one run (X-Automap-Seq 0 to 399; 400 or more is a 400). rateLimit: requests per rateWindowSeconds for one installation's key, counted for every request whose key matches, refused ones included (429 rate-limited); the window is fixed, not rolling. maxFlows: Atlassian lists at most 10,000 rules a month and Advanced keeps every rule a usage push carries; 10,000 is the cap the app applies where a plan sets no figure. runsMaxRows / runsMaxErrors: rows and errors of one runs push that are kept, the rest dropped. runsMaxWindowDays: a runs window longer than this is a 400. runsKeepDays: how many days of runs the app keeps."
+  },
+  "x-automap-plans": {
+    "basic": { "push": false, "usage": false },
+    "advanced": { "push": true, "usage": true },
+    "description": "push: rules may be pushed. usage: usage and runs may be pushed. Basic (sold as Standard) loads rules from an export file only: every push of any kind is 403 disabled. Advanced takes all three kinds."
+  },
+  "x-automap-senders": {
+    "description": "The senders we publish (github.com/MOY-Apps/automap-sync), the lowest version the receiver takes, the latest one, and every version released. A sender below `min` gets 426 upgrade; below `latest` it is taken and the settings page says an update is out. Any other name, or no X-Automap-Sender header, is taken unnamed.",
+    "python": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
+    "node": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
+    "bash": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
+    "powershell": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
+    "scriptrunner": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.0.1", "1.1.0", "1.2.0", "1.2.1", "1.3.0"] },
+    "jmwe": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.2.1", "1.3.0"] }
+  },
+  "paths": {
+    "/v1": {
+      "get": {
+        "operationId": "alive",
+        "summary": "Liveness check",
+        "description": "Needs no key. Proves the URL is right. Any other method on /v1 is 404.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The receiver is there.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Alive" },
+                "examples": {
+                  "alive": { "value": { "ok": true, "receiver": "automation-map", "protocol": "v1" }, "x-automap-action": "none" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/push": {
+      "post": {
+        "operationId": "push",
+        "summary": "Send one chunk of one push",
+        "description": "A push is one JSON document (rules, usage or runs), serialised once, split into chunks of at most 200,000 bytes, and sent in order under one run id. One request is one chunk. The last chunk carries X-Automap-Last and a proof of the whole document (SHA-256, or the length).\n\nThe receiver checks, in this order: the path (404) and the method (405); that this installation takes pushes (403); the key (401); the rate (429 rate-limited); the subscription (402); the headers (400); the plan (403); the sender version (426); compression, an empty body (400) and the size (413). Then, for rules: chunk order and run state (409) and, on chunk 0 of a new run, the load allowance (429 allowance). For usage and runs: the plan again (403) and chunk order (409). On the last chunk: the proof (422) and, for usage and runs, the JSON shape (400).\n\nRules: the last chunk queues a build; the map rebuilds in a minute or two and a finished build counts as one load. Usage and runs: kept at once, no build, no load counted.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Run" },
+          { "$ref": "#/components/parameters/Seq" },
+          { "$ref": "#/components/parameters/Last" },
+          { "$ref": "#/components/parameters/Sha256" },
+          { "$ref": "#/components/parameters/Length" },
+          { "$ref": "#/components/parameters/Kind" },
+          { "$ref": "#/components/parameters/Sender" },
+          { "$ref": "#/components/parameters/ContentEncoding" }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "One slice of the serialised document, as is. Send `Content-Type: text/plain; charset=utf-8` (every published sender does). The body must not be empty and must not be compressed. The schema below is the whole document the joined chunks make, not one chunk.",
+          "content": {
+            "text/plain; charset=utf-8": {
+              "schema": {
+                "type": "string",
+                "minLength": 1,
+                "description": "A slice of at most 262,144 bytes of UTF-8 (send 200,000). Compact JSON (no indentation, no line breaks), best escaped to ASCII (\\uXXXX), so a split by bytes never cuts a character. Without ASCII escaping, split on character boundaries and never between the two halves of a UTF-16 surrogate pair.",
+                "contentMediaType": "application/json",
+                "contentSchema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/RulesPayload" },
+                    { "$ref": "#/components/schemas/UsagePayload" },
+                    { "$ref": "#/components/schemas/RunsPayload" }
+                  ]
+                }
+              },
+              "examples": {
+                "rules": {
+                  "summary": "X-Automap-Kind: rules (or no Kind header)",
+                  "value": "{\"rules\":[{\"rule\":{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"name\":\"Close the parent\",\"state\":\"ENABLED\",\"created\":1757000000,\"updated\":1757000500,\"canOtherRuleTrigger\":false,\"ruleScopeARIs\":[\"ari:cloud:jira:<cloud-id>:project/10001\"],\"trigger\":{\"component\":\"TRIGGER\",\"type\":\"jira.issue.event.trigger:transitioned\",\"value\":{}},\"components\":[],\"labels\":[],\"description\":\"\"}}],\"sender\":{\"name\":\"acme-sync\",\"version\":\"1.0.0\"}}"
+                },
+                "usage": {
+                  "summary": "X-Automap-Kind: usage",
+                  "value": "{\"usage\":{\"period\":{\"start\":1790812800000,\"end\":1791990000000},\"steps\":{\"total\":1322,\"jira\":1322,\"other\":0},\"rovo\":{\"total\":0,\"jira\":0,\"other\":0},\"flows\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"name\":\"MARKET: Licenses create\",\"state\":\"ENABLED\",\"runs\":14,\"steps\":1303,\"rovo\":0,\"deleted\":false,\"agentic\":false}],\"billable\":{\"month\":\"2026-10\",\"rules\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"runs\":14}]},\"limits\":[{\"product\":\"JIRA_SERVICE_MANAGEMENT\",\"used\":18,\"limit\":3000,\"edition\":\"premium\"}],\"trend\":[{\"month\":\"2026-09\",\"runs\":{\"JIRA_SERVICE_MANAGEMENT\":1073}}],\"creditPack\":false}}"
+                },
+                "runs": {
+                  "summary": "X-Automap-Kind: runs",
+                  "value": "{\"runs\":{\"window\":{\"start\":1791331200000,\"end\":1791991583000},\"rows\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"day\":\"2026-10-13\",\"name\":\"MARKET: Licenses create\",\"success\":10,\"errors\":30,\"noop\":0,\"edits\":1,\"ms\":1200000,\"maxMs\":31000,\"hours\":{\"9\":12,\"14\":28}}],\"errors\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"componentId\":\"5ce09150-0000-4000-8000-000000000000\",\"componentType\":\"BRANCH\",\"type\":\"jira.smart.values.branch\",\"code\":\"com.codebarrel.automation.rule.error.smart.value.no.object\",\"at\":1791968400000}]}}"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Taken. `accepted`: the chunk is stored; send the next one. `queued`: the last chunk proved the whole document. For rules a build is queued and the map rebuilds in a minute or two. For usage and runs the data is already kept (nothing is queued, despite the word).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Accepted" },
+                "examples": {
+                  "accepted": { "value": { "accepted": true }, "x-automap-action": "next-chunk" },
+                  "queued": { "value": { "accepted": true, "queued": true }, "x-automap-action": "done" }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a push. A header is missing or malformed (run id, seq, kind, a last chunk without a valid X-Automap-Sha256 or X-Automap-Length), seq is 400 or more, the body is empty or compressed. For usage and runs also: the joined document is not JSON, or not a usage / runs document (for example no `period`, or a runs window over 31 days). Fix the sender; sending the same request again will not help.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "bad-request": { "value": { "error": "bad-request", "detail": "missing or malformed X-Automap-* headers, an empty or compressed body" }, "x-automap-action": "fix" }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No key, a wrong key, or a revoked key. Stop; an administrator makes a new key in the app's settings.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "unauthorized": { "value": { "error": "unauthorized", "detail": "missing, wrong or revoked sync key" }, "x-automap-action": "stop" }
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The Automation Map subscription on this site has ended. Stop.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "inactive": { "value": { "error": "inactive", "detail": "the Automation Map subscription on this site has ended" }, "x-automap-action": "stop" }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This installation does not take this push: push sync is not switched on for it, or the site is on Basic (sold as Standard), where rules come in as an export file only and usage and runs are not taken. Answered before the key is checked when sync is off. Stop; do not read usage or runs for an answer known in advance.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "disabled": { "value": { "error": "disabled", "detail": "automatic sync is not switched on for this installation" }, "x-automap-action": "stop" }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The path is neither POST /v1/push nor GET /v1. Check the URL.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "not-found": { "value": { "error": "not-found", "detail": "POST /v1/push, GET /v1" }, "x-automap-action": "fix" }
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Something other than POST on /v1/push. Use POST.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "method": { "value": { "error": "method", "detail": "POST only" }, "x-automap-action": "fix" }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Out of order. Chunk n arrived before chunks 0 to n-1 of the same run; the run is unknown; the last chunk came while chunks are missing; or (rules only) the run is already closed, because its last chunk was taken. Start a new run, with a new run id, from chunk 0. A 409 on a resent last chunk of rules can mean the first copy arrived and the push is done.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "conflict": { "value": { "error": "conflict", "detail": "chunk out of order, run already finished, or last chunk sent early - start a new run" }, "x-automap-action": "new-run" }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "This chunk is over 262,144 bytes. Send chunks of 200,000 bytes.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "too-large": { "value": { "error": "too-large", "detail": "chunk over 256 KiB - send 200 KB chunks" }, "x-automap-action": "fix" }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The joined chunks do not match X-Automap-Sha256 or X-Automap-Length. Nothing was kept; for rules the build is marked failed and the previous map stays. Start a new run. If it repeats, check that the document is compact JSON without line breaks, the hash is over the UTF-8 bytes, the length counts UTF-16 code units, and nothing compresses or rewrites the body on the way.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "checksum": { "value": { "error": "checksum", "detail": "the joined chunks do not match X-Automap-Sha256 or X-Automap-Length - nothing was loaded" }, "x-automap-action": "new-run" }
+                }
+              }
+            }
+          },
+          "426": {
+            "description": "X-Automap-Sender names one of our senders at a version below its minimum. Nothing was staged. Update the sender. Today every minimum is 1.0.0, so no released version gets this.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "upgrade": { "value": { "error": "upgrade", "detail": "this sender version is no longer accepted - update it (docker pull, or the latest script from senders/)" }, "x-automap-action": "stop" }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Try later; the `error` word says which. `allowance` (rules only, on chunk 0 of a new run): the plan's loads are used up (Advanced: 5 in a rolling day, files and pushes alike); the settings page says when the next is possible. Stop this run and schedule the sender within the allowance; usage and runs are still taken. `rate-limited`: over 300 requests for this key in the current 10-minute window; wait ten minutes, then start a new run.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "allowance": { "value": { "error": "allowance", "detail": "the plan load allowance is used up - see the settings page", "retryable": true }, "x-automap-action": "wait" },
+                  "rate-limited": { "value": { "error": "rate-limited", "detail": "too many requests for this key, try again in ten minutes", "retryable": true }, "x-automap-action": "wait" }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The receiver could not store the chunk. Send the same chunk again with a backoff (for example 2 s, then 4 s); if it keeps failing, start a new run later. Resending a chunk is safe: it replaces the copy already received.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "examples": {
+                  "failed": { "value": { "error": "failed", "detail": "the receiver could not store the chunk - retry the run", "retryable": true }, "x-automap-action": "retry" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "`Authorization: Bearer <push-key>`. The key starts `amk_`; the app shows it once when it is made. One key per site; a new key revokes the old one at once. Since 1.0.0."
+      },
+      "automapKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Automap-Key",
+        "description": "The same key in a header of its own, for a client that cannot set Authorization. If both are sent, X-Automap-Key wins. Since 1.0.0."
+      }
+    },
+    "parameters": {
+      "Run": {
+        "name": "X-Automap-Run",
+        "in": "header",
+        "required": true,
+        "description": "The run id: the same on every chunk of one push, new for every push (a UUID without dashes works). Since 1.0.0.",
+        "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+        "x-automap-since": "1.0.0"
+      },
+      "Seq": {
+        "name": "X-Automap-Seq",
+        "in": "header",
+        "required": true,
+        "description": "The chunk's number: 0, 1, 2, ... in order, one request at a time. Chunk 0 starts the run, or restarts it: it clears what the run had staged. For usage and runs, a chunk 0 of several clears what any run of that kind had staged, so send one push of each kind at a time. Since 1.0.0.",
+        "schema": { "type": "integer", "minimum": 0, "maximum": 399 },
+        "x-automap-since": "1.0.0"
+      },
+      "Last": {
+        "name": "X-Automap-Last",
+        "in": "header",
+        "required": false,
+        "description": "`1` (or `true`, any case) on the last chunk only. Any other value, or none, means more chunks follow. A push of one chunk sends it on chunk 0. Since 1.0.0.",
+        "schema": { "type": "string", "enum": ["1", "true"] },
+        "x-automap-since": "1.0.0"
+      },
+      "Sha256": {
+        "name": "X-Automap-Sha256",
+        "in": "header",
+        "required": false,
+        "description": "On the last chunk: the SHA-256, in hex, of the UTF-8 bytes of the whole serialised document (all chunks joined). The last chunk needs this or X-Automap-Length; given both, both must match. Ignored on other chunks. Since 1.0.0.",
+        "schema": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "x-automap-since": "1.0.0"
+      },
+      "Length": {
+        "name": "X-Automap-Length",
+        "in": "header",
+        "required": false,
+        "description": "On the last chunk, for a sender that cannot hash: the length of the whole serialised document in UTF-16 code units (what a JavaScript string's `length` says; an emoji counts 2), not in bytes. Weaker than SHA-256: it catches a truncated document, not a changed character. Since 1.0.0 (JMWE).",
+        "schema": { "type": "string", "pattern": "^\\d{1,10}$" },
+        "x-automap-since": "1.0.0"
+      },
+      "Kind": {
+        "name": "X-Automap-Kind",
+        "in": "header",
+        "required": false,
+        "description": "What the push carries. Without it, `rules`, as every sender before 1.1.0 sent. `usage` and `runs` are beta and need the Advanced edition. Any case. Send it on every chunk of the run. Since 1.1.0.",
+        "schema": { "type": "string", "enum": ["rules", "usage", "runs"], "default": "rules" },
+        "x-automap-since": "1.1.0"
+      },
+      "Sender": {
+        "name": "X-Automap-Sender",
+        "in": "header",
+        "required": false,
+        "description": "`<name>/<major>.<minor>.<patch>`, the name in lower-case letters. Our senders send python, node, bash, powershell, scriptrunner or jmwe. One of those names below its minimum version gets 426. Any other name, a value of another shape, or no header: the push is taken unnamed, and the settings page shows no sender for it. A sender of your own should send its own name (or nothing), never one of ours. Since 1.0.0.",
+        "schema": { "type": "string", "pattern": "^[a-z]{2,20}/\\d{1,4}\\.\\d{1,4}\\.\\d{1,4}$" },
+        "x-automap-since": "1.0.0"
+      },
+      "ContentEncoding": {
+        "name": "Content-Encoding",
+        "in": "header",
+        "required": false,
+        "description": "Do not compress. A gzip body cannot be recovered on the platform and is answered 400.",
+        "schema": { "type": "string", "not": { "pattern": "gzip" } },
+        "x-automap-since": "1.0.0"
+      }
+    },
+    "schemas": {
+      "Alive": {
+        "type": "object",
+        "properties": {
+          "ok": { "const": true },
+          "receiver": { "const": "automation-map" },
+          "protocol": { "const": "v1" }
+        }
+      },
+      "Accepted": {
+        "type": "object",
+        "required": ["accepted"],
+        "properties": {
+          "accepted": { "const": true },
+          "queued": { "const": true, "description": "Present on the last chunk: the whole document was proven and taken." }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": ["bad-request", "unauthorized", "inactive", "disabled", "not-found", "method", "conflict", "too-large", "checksum", "upgrade", "allowance", "rate-limited", "failed"]
+          },
+          "detail": { "type": "string", "description": "A fixed sentence; it never says anything about your data." },
+          "retryable": { "const": true, "description": "Present on 429 and 500." }
+        }
+      },
+      "SenderInfo": {
+        "type": "object",
+        "description": "Optional and informational. The receiver reads who sent a push from the X-Automap-Sender header, not from here.",
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "rules": { "type": "integer", "description": "How many rules the document holds; our senders add it to the rules push." }
+        }
+      },
+      "RulesPayload": {
+        "type": "object",
+        "description": "X-Automap-Kind: rules. Every rule, enabled and disabled, in the Automation Rule Management API's shape, each wrapped in `rule`. Unknown top-level keys are ignored. Do not strip or mask secrets: the app's build replaces every credential it recognises before anything is parsed or stored. A document whose rule scopes name another Jira site is refused by the build (shown on the settings page). An Automation-screen export (rules not wrapped in `rule`) is also accepted but carries less.",
+        "required": ["rules"],
+        "properties": {
+          "rules": { "type": "array", "items": { "$ref": "#/components/schemas/RuleEntry" } },
+          "sender": { "$ref": "#/components/schemas/SenderInfo" }
+        }
+      },
+      "RuleEntry": {
+        "type": "object",
+        "required": ["rule"],
+        "properties": {
+          "rule": {
+            "type": "object",
+            "description": "The rule exactly as GET https://api.atlassian.com/automation/public/jira/<cloud-id>/rest/v1/rule/<uuid> returns it (unwrapped from `rule` if the API wrapped it). The fields below are the ones the map reads most; send the rest as they are.",
+            "properties": {
+              "uuid": { "type": "string" },
+              "name": { "type": "string" },
+              "state": { "type": "string", "examples": ["ENABLED", "DISABLED"] },
+              "created": { "type": "integer" },
+              "updated": { "type": "integer" },
+              "canOtherRuleTrigger": { "type": "boolean" },
+              "ruleScopeARIs": { "type": "array", "items": { "type": "string" } },
+              "trigger": { "type": "object" },
+              "components": { "type": "array", "items": { "type": "object" } },
+              "labels": { "type": "array" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      },
+      "UsagePayload": {
+        "type": "object",
+        "description": "X-Automap-Kind: usage (beta, Advanced). One month of the site's automation usage, as Jira's Usage tab shows it. The app keeps one snapshot per month (the UTC month of `period.start`); a newer push for the same month replaces it. Fields not listed here are dropped, account ids included. No build, no load counted.",
+        "required": ["usage"],
+        "properties": {
+          "usage": { "$ref": "#/components/schemas/Usage" },
+          "sender": { "$ref": "#/components/schemas/SenderInfo" }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "required": ["period"],
+        "properties": {
+          "period": {
+            "type": "object",
+            "description": "Unix ms, UTC: the 1st of the month to now (or to the month's end). Both above 0 and end not before start, or the push is a 400.",
+            "required": ["start", "end"],
+            "properties": { "start": { "type": "integer", "minimum": 1 }, "end": { "type": "integer", "minimum": 1 } }
+          },
+          "steps": { "$ref": "#/components/schemas/Split" },
+          "rovo": { "$ref": "#/components/schemas/Split" },
+          "flows": {
+            "type": "array",
+            "description": "One entry per rule with usage this month. Send every rule; Advanced keeps them all. An entry without a valid uuid is dropped.",
+            "items": { "$ref": "#/components/schemas/UsageFlow" }
+          },
+          "billable": {
+            "type": ["object", "null"],
+            "description": "Optional. Billable runs per rule for a month; dropped if `month` is not YYYY-MM. The first 100 rules are kept.",
+            "properties": {
+              "month": { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              "rules": { "type": "array", "items": { "type": "object", "properties": { "uuid": { "$ref": "#/components/schemas/RuleId" }, "runs": { "$ref": "#/components/schemas/Count" } } } }
+            }
+          },
+          "limits": {
+            "type": "array",
+            "description": "Optional. Monthly run limits per product. The first 10 are kept.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "product": { "type": "string", "pattern": "^[A-Z_]{1,40}$" },
+                "used": { "$ref": "#/components/schemas/Count" },
+                "limit": { "$ref": "#/components/schemas/Count" },
+                "edition": { "type": "string", "maxLength": 40 }
+              }
+            }
+          },
+          "trend": {
+            "type": "array",
+            "description": "Optional. Runs per product in past months. The first 12 months, 10 products each, are kept.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "month": { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+                "runs": { "type": "object", "propertyNames": { "pattern": "^[A-Z_]{1,40}$" }, "additionalProperties": { "$ref": "#/components/schemas/Count" } }
+              }
+            }
+          },
+          "creditPack": { "type": "boolean", "description": "Optional." }
+        }
+      },
+      "UsageFlow": {
+        "type": "object",
+        "required": ["uuid"],
+        "properties": {
+          "uuid": { "$ref": "#/components/schemas/RuleId" },
+          "name": { "type": "string", "description": "Cut to 255 characters." },
+          "state": { "type": "string", "enum": ["ENABLED", "DISABLED"], "description": "Anything but DISABLED is kept as ENABLED." },
+          "runs": { "$ref": "#/components/schemas/Count" },
+          "steps": { "$ref": "#/components/schemas/Count" },
+          "rovo": { "$ref": "#/components/schemas/Count" },
+          "deleted": { "type": "boolean" },
+          "agentic": { "type": "boolean" }
+        }
+      },
+      "RunsPayload": {
+        "type": "object",
+        "description": "X-Automap-Kind: runs (beta, Advanced). The automation audit log of a window of whole UTC days, folded on your side into counts per rule and day, plus the failing component and error code of some failed runs. Counts and codes only: no work-item ids, no message text, no account ids. Fields not listed here are dropped. The days the window covers replace what the app had for them; other days are kept, 35 days back. No build, no load counted.",
+        "required": ["runs"],
+        "properties": {
+          "runs": { "$ref": "#/components/schemas/Runs" },
+          "sender": { "$ref": "#/components/schemas/SenderInfo" }
+        }
+      },
+      "Runs": {
+        "type": "object",
+        "required": ["window"],
+        "properties": {
+          "window": {
+            "type": "object",
+            "description": "Unix ms. Both above 0, end not before start, and at most 31 days apart, or the push is a 400.",
+            "required": ["start", "end"],
+            "properties": { "start": { "type": "integer", "minimum": 1 }, "end": { "type": "integer", "minimum": 1 } }
+          },
+          "rows": {
+            "type": "array",
+            "description": "One row per rule and UTC day. The first 20,000 are kept. Rows with an invalid uuid or day are dropped; for a repeated (uuid, day) the last row wins.",
+            "items": { "$ref": "#/components/schemas/RunsRow" }
+          },
+          "errors": {
+            "type": "array",
+            "description": "Failed components of failed runs. The first 500 are kept; per rule the app keeps the 5 newest.",
+            "items": { "$ref": "#/components/schemas/RunsError" }
+          }
+        }
+      },
+      "RunsRow": {
+        "type": "object",
+        "required": ["uuid", "day"],
+        "properties": {
+          "uuid": { "$ref": "#/components/schemas/RuleId" },
+          "day": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "UTC day." },
+          "name": { "type": "string", "description": "Cut to 255 characters." },
+          "success": { "$ref": "#/components/schemas/Count" },
+          "errors": { "$ref": "#/components/schemas/Count" },
+          "noop": { "$ref": "#/components/schemas/Count", "description": "Runs that did nothing (NO_ACTIONS_PERFORMED)." },
+          "edits": { "$ref": "#/components/schemas/Count", "description": "Edits of the rule (CONFIG_CHANGE), not runs." },
+          "ms": { "$ref": "#/components/schemas/Count", "description": "Total run time that day, ms." },
+          "maxMs": { "$ref": "#/components/schemas/Count", "description": "Longest run that day, ms." },
+          "hours": {
+            "type": "object",
+            "description": "Optional, sparse: runs (not edits) per UTC hour, only hours that had any. Keys 0 to 23.",
+            "propertyNames": { "pattern": "^\\d{1,2}$" },
+            "additionalProperties": { "$ref": "#/components/schemas/Count" }
+          }
+        }
+      },
+      "RunsError": {
+        "type": "object",
+        "required": ["uuid"],
+        "properties": {
+          "uuid": { "$ref": "#/components/schemas/RuleId" },
+          "componentId": { "type": "string", "maxLength": 64 },
+          "componentType": { "type": "string", "maxLength": 40, "examples": ["ACTION", "BRANCH", "CONDITION", "TRIGGER"] },
+          "type": { "type": "string", "maxLength": 160, "examples": ["jira.smart.values.branch"] },
+          "code": { "type": "string", "maxLength": 160, "description": "The error's i18n key or code. Characters outside A-Z a-z 0-9 . _ : - are removed; empty becomes SOME_ERRORS." },
+          "at": { "$ref": "#/components/schemas/Count", "description": "When the run happened, Unix ms." }
+        }
+      },
+      "RuleId": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9-]{1,64}$",
+        "description": "The rule's uuid as the Automation API gives it."
+      },
+      "Count": {
+        "type": "number",
+        "minimum": 0,
+        "description": "A number of 0 or more, rounded to an integer. Anything else is kept as 0."
+      },
+      "Split": {
+        "type": "object",
+        "description": "A total, split into Jira and other products.",
+        "properties": {
+          "total": { "$ref": "#/components/schemas/Count" },
+          "jira": { "$ref": "#/components/schemas/Count" },
+          "other": { "$ref": "#/components/schemas/Count" }
+        }
+      }
+    }
+  }
+}

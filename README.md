@@ -6,6 +6,9 @@ small job on **your** side reads the rules with **your** token and pushes them t
 The token never leaves your infrastructure; the app only ever sees a key it issued
 (`amk_…`). The protocol is in [`PROTOCOL.md`](PROTOCOL.md).
 
+Writing your own sender, in another language? See the API reference, [`API.md`](API.md), and
+the OpenAPI 3.1 spec, [`openapi.json`](openapi.json).
+
 ## Pick one
 
 | Sender | Runs on | Needs | Use it when |
