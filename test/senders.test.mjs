@@ -113,12 +113,15 @@ for (const s of SENDERS) {
   });
 }
 
-// usage (beta): only the Python sender reads it so far
-const py = SENDERS.find((x) => x.name === 'python');
-test('python: usage (beta) is pushed apart from the rules, without account ids, and never fails the run', { skip: py.ok ? false : 'no python3', timeout: 120_000 }, async () => {
+// usage and runs (beta): every sender reads them the same way (APPS-488)
+for (const s of SENDERS) {
+  const available = s.ok || s.local || dockerUp;
+  const host = !s.ok && !s.local ? 'host.docker.internal' : '127.0.0.1';
+  test(`${s.name}: usage and runs (beta) are pushed apart from the rules, without ids, and never fail the run`, { skip: available ? false : `${s.name}: runtime not available`, timeout: 240_000 }, async () => {
+  const py = s;
   const rules = makeRules(3);
-  const site = await startFakeSite({ rules, flaky: false });
-  const broken = await startFakeSite({ rules, flaky: false, usage: 'broken' });
+  const site = await startFakeSite({ rules, host, flaky: false });
+  const broken = await startFakeSite({ rules, host, flaky: false, usage: 'broken' });
   try {
     const { code, out } = await runSender(py, site);
     assert.equal(code, 0, out);
@@ -161,6 +164,70 @@ test('python: usage (beta) is pushed apart from the rules, without account ids, 
     const before = site.state.pushed.usageCalls;
     assert.equal((await runSender(py, site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
     assert.equal(site.state.pushed.usageCalls, before);
+  } finally {
+    await site.close();
+    await broken.close();
+  }
+});
+}
+
+// JMWE renders a template instead of running a program: no exit codes, one line of output.
+// It needs the nunjucks package (NUNJUCKS_DIR, a folder with node_modules/nunjucks).
+const nunjucksDir = process.env.NUNJUCKS_DIR;
+function runJmwe(site, extraEnv = {}) {
+  const envv = { ...process.env, ...site.env, ATLASSIAN_SITE: site.env.ATLASSIAN_API_BASE, NUNJUCKS_DIR: nunjucksDir, ...extraEnv };
+  // spawn, not spawnSync: the fake site answers from this very process
+  return new Promise((resolve) => {
+    const child = spawn('node', [join(root, 'jmwe/test/run-locally.mjs')], { env: envv });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.on('close', (code) => resolve({ code, out }));
+  });
+}
+test('jmwe: rules, usage and runs (beta), apart from each other, without ids, never stopping the rules', { skip: nunjucksDir ? false : 'jmwe: set NUNJUCKS_DIR to a folder with nunjucks installed', timeout: 240_000 }, async () => {
+  const rules = makeRules(3);
+  const site = await startFakeSite({ rules, flaky: false });
+  const broken = await startFakeSite({ rules, flaky: false, usage: 'broken' });
+  try {
+    const { code, out } = await runJmwe(site);
+    assert.equal(code, 0, out);
+    assert.equal(site.state.loaded.length, 1, out);
+    const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
+    assert.equal(u.steps.total, 1310);
+    assert.deepEqual(u.flows.map((f) => [f.uuid, f.runs, f.steps]), [[rules[0].uuid, 14, 1303], [rules[1].uuid, 5, 7]]);
+    assert.deepEqual(u.billable.rules, [{ uuid: rules[0].uuid, runs: 14 }]);
+    assert.deepEqual(u.limits, [{ product: 'JIRA_SERVICE_MANAGEMENT', used: 18, limit: 3000, edition: 'premium' }]);
+    assert.ok(!JSON.stringify(site.state.pushed.usage).includes('secret'), 'no account id leaves the template');
+    assert.match(out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+    const r = site.state.pushed.runs[site.state.pushed.runs.length - 1].runs;
+    const a = r.rows.find((x) => x.uuid === rules[0].uuid);
+    assert.deepEqual([a.success, a.errors, a.noop], [1, 1, 0]);
+    const b = r.rows.find((x) => x.uuid === rules[1].uuid);
+    assert.deepEqual([b.noop, b.edits], [1, 1]);
+    const perHour = (id) => r.rows.filter((x) => x.uuid === id)
+      .reduce((n, x) => n + Object.values(x.hours || {}).reduce((m, v) => m + v, 0), 0);
+    assert.equal(perHour(rules[0].uuid), 2);
+    assert.equal(perHour(rules[1].uuid), 1);
+    assert.deepEqual(r.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
+    const sent = JSON.stringify(site.state.pushed.runs);
+    assert.ok(!sent.includes('secret-') && !sent.includes('10042'), 'no message text, no parameters, no work item ids');
+    assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
+    // the day each run is filed under is the UTC day, worked out without a date library
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    assert.ok(r.rows.every((x) => x.day === today || x.day === yesterday), JSON.stringify(r.rows.map((x) => x.day)));
+
+    const gone = await runJmwe(broken);
+    assert.equal(gone.code, 0, gone.out);
+    assert.equal(broken.state.loaded.length, 1);
+    assert.equal(broken.state.pushed.usage.length, 0);
+    assert.match(gone.out, /usage \(beta\) skipped/);
+    assert.match(gone.out, /runs \(beta\) skipped/);
+
+    const before = site.state.usageCalls;
+    assert.equal((await runJmwe(site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
+    assert.equal(site.state.usageCalls, before);
   } finally {
     await site.close();
     await broken.close();

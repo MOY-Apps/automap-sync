@@ -17,6 +17,16 @@
   Each rule is one request; a site with many hundreds of rules may run longer than a
   JMWE action is allowed to - use another sender there.
 
+  Usage and runs (BETA, from 1.1.0, Advanced edition), as in the Python sender: after the
+  rules, this month's steps, Rovo credits and flow runs per rule, and the audit log of the
+  last RUNS_DAYS days folded into per-rule, per-day counts, are read from the internal API
+  behind Jira's Usage and Audit log tabs and pushed as two separate pushes. That API is
+  undocumented and can change: a failure there is reported and never stops the rules. No
+  account ids, no issue ids and no message text leave. Each push is one chunk of at most
+  80 000 characters, so on a very large site only the busiest rules are kept. Set USAGE or
+  RUNS to false below to leave either out; if the audit log has more than RUNS_MAX_PAGES
+  pages of 50, the runs are left out rather than sent in part - set RUNS_DAYS lower.
+
   The rendered output is one line saying what happened; it lands in JMWE's logs.
 
   Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
@@ -26,9 +36,13 @@
 {%- set TOKEN = "an API token with the Automation scope" -%}
 {%- set PUSH_URL = "the receiver URL from Automation Map, ending /v1/push" -%}
 {%- set KEY = "the amk_ key from Automation Map" -%}
+{%- set USAGE = true -%}
+{%- set RUNS = true -%}
+{%- set RUNS_DAYS = 7 -%}
+{%- set RUNS_MAX_PAGES = 60 -%}
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.0.0" -%}
+{%- set VERSION = "1.1.0" -%}
 {%- set CHUNK = 80000 -%}
 {%- set MAX_PAGES = 100 -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
@@ -104,4 +118,242 @@
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-automap-sync {{ NAME }} {{ VERSION }}: {{ ids.length }} rules, {{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else "pushed, the map is rebuilding" }}
+{#- 5. usage and runs (BETA): the internal API behind Jira's Usage and Audit log tabs -#}
+{%- macro ymd(days) -%}
+{%- set z = days + 719468 -%}
+{%- set era = z // 146097 -%}
+{%- set doe = z - era * 146097 -%}
+{%- set yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365 -%}
+{%- set doy = doe - (365 * yoe + yoe // 4 - yoe // 100) -%}
+{%- set mp = (5 * doy + 2) // 153 -%}
+{%- set dd = doy - (153 * mp + 2) // 5 + 1 -%}
+{%- set mm = (mp + 3) if mp < 10 else (mp - 9) -%}
+{%- set yy = yoe + era * 400 + (1 if mm <= 2 else 0) -%}
+{{- yy }}-{{ ("0" if mm < 10 else "") + mm }}-{{ ("0" if dd < 10 else "") + dd -}}
+{%- endmacro -%}
+{%- set notes = [] -%}
+{%- set shut = (failures.length > 0 and failures[0].indexOf("HTTP 403") >= 0) -%}
+{%- set INTERNAL = "https://api.atlassian.com/automation/internal-api/jira/" + tenant.cloudId + "/pro/rest/GLOBAL/" -%}
+{%- set nowMs = (now | date("x")) | int -%}
+{%- set dayNow = nowMs // 86400000 -%}
+{%- set LIMIT = 80000 -%}
+{%- macro pushKind(kind, body) -%}
+{%- set res = PUSH_URL | callRest(verb="post", body=body, noJSON=true, dontFail=true, options={ "headers": {
+    "Authorization": "Bearer " + KEY, "Content-Type": "text/plain; charset=utf-8",
+    "X-Automap-Run": NAME + "-" + kind + "-" + body.length + "-" + nowMs, "X-Automap-Seq": "0", "X-Automap-Last": "1",
+    "X-Automap-Length": "" + body.length, "X-Automap-Sender": NAME + "/" + VERSION, "X-Automap-Kind": kind }, "timeout": 60000 }) -%}
+{{- ("HTTP " + res._statusCode) if res._statusCode else "" -}}
+{%- endmacro -%}
+
+{%- if USAGE and not shut -%}
+  {%- set today = ymd(dayNow) | trim -%}
+  {%- set firstDay = dayNow - (today.slice(8, 10) | int) + 1 -%}
+  {%- set periods = [] -%}
+  {#- this month so far; and in its first three days the whole of the month before -#}
+  {%- if (today.slice(8, 10) | int) <= 3 -%}
+    {%- set prevLast = ymd(firstDay - 1) | trim -%}
+    {%- set _ = periods.push([(firstDay - (prevLast.slice(8, 10) | int)) * 86400000, firstDay * 86400000 - 1, prevLast.slice(0, 7)]) -%}
+  {%- endif -%}
+  {%- set _ = periods.push([firstDay * 86400000, nowMs, today.slice(0, 7)]) -%}
+  {%- set uStop = [] -%}
+  {%- for pi in range(0, periods.length) -%}
+    {%- if pi < periods.length and not uStop.length -%}
+      {%- set pd = periods[pi] -%}
+      {%- set q = "startTime=" + pd[0] + "&endTime=" + pd[1] -%}
+      {%- set credit = (INTERNAL + "creditUsage?" + q) | callRest(options=OPTS, dontFail=true) -%}
+      {%- if credit._statusCode or credit._error -%}
+        {%- set _ = uStop.push("usage (beta) skipped: creditUsage answered " + (credit._statusCode or "nothing")) -%}
+      {%- else -%}
+        {%- set fKeys = [] -%}
+        {%- set flows = [] -%}
+        {%- set bad = [] -%}
+        {#- sortBy also filters to rules with that metric above zero: read both and merge -#}
+        {%- for sortBy in ["automationCredits", "rovoCredits"] -%}
+          {%- set seenN = [0] -%}
+          {%- set done = [] -%}
+          {%- for page in range(0, 100) -%}
+            {%- if page < 100 and not done.length and not bad.length -%}
+              {%- set r = (INTERNAL + "highUsageFlows?limit=100&page=" + page + "&sortBy=" + sortBy + "&" + q) | callRest(options=OPTS, dontFail=true) -%}
+              {%- if r._statusCode or r._error -%}
+                {%- set _ = bad.push("highUsageFlows answered " + (r._statusCode or "nothing")) -%}
+              {%- else -%}
+                {%- set got = r.flows or [] -%}
+                {%- for f in got -%}
+                  {%- if f.ruleUuid -%}
+                    {%- set row = { "uuid": f.ruleUuid, "name": f.ruleName or "", "state": f.state or "ENABLED", "runs": f.runs or 0,
+                                    "steps": f.automationCredits or 0, "rovo": f.rovoCredits or 0,
+                                    "deleted": true if f.deleted else false, "agentic": true if f.containsAgentic else false } -%}
+                    {%- set at = fKeys.indexOf(f.ruleUuid) -%}
+                    {%- if at < 0 -%}
+                      {%- set _ = fKeys.push(f.ruleUuid) -%}
+                      {%- set _ = flows.push(row) -%}
+                    {%- else -%}
+                      {%- set _ = flows.splice(at, 1, row) -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- set _ = seenN.splice(0, 1, seenN[0] + got.length) -%}
+                {%- if got.length == 0 or seenN[0] >= (r.totalCount or 0) -%}{%- set _ = done.push(1) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- if bad.length -%}
+          {%- set _ = uStop.push("usage (beta) skipped: " + bad[0]) -%}
+        {%- else -%}
+          {#- the rest is the current billing model, and the least stable part: each piece optional -#}
+          {%- set top = (INTERNAL + "highestUsages?limit=100&month=" + pd[2]) | callRest(options=OPTS, dontFail=true) -%}
+          {%- set bill = [] -%}
+          {%- if not top._statusCode and not top._error and top.length is defined -%}
+            {%- for t in top -%}{%- if t.ruleIdUuid -%}{%- set _ = bill.push({ "uuid": t.ruleIdUuid, "runs": t.executionCount or 0 }) -%}{%- endif -%}{%- endfor -%}
+          {%- endif -%}
+          {%- set ctx = (INTERNAL + "pagecontext") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set lims = [] -%}
+          {%- if not ctx._statusCode and ctx.tenantPageContext and ctx.tenantPageContext.usage and ctx.tenantPageContext.usage.workspaceUsages -%}
+            {%- for k, v in ctx.tenantPageContext.usage.workspaceUsages -%}
+              {%- set _ = lims.push({ "product": k, "used": v.executionsUsed or 0, "limit": v.executionLimit or 0, "edition": v.edition or "" }) -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- set tr = (INTERNAL + "usageTrendData") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set trend = [] -%}
+          {%- if not tr._statusCode and tr.data -%}
+            {%- for t in tr.data -%}{%- set _ = trend.push({ "month": t.month, "runs": t.workspaceCounts or {} }) -%}{%- endfor -%}
+          {%- endif -%}
+          {%- set pack = (INTERNAL + "hasCreditPack") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set ca = credit.automation or {} -%}
+          {%- set cr = credit.rovo or {} -%}
+          {%- set head = '{"period":' + ({ "start": pd[0], "end": pd[1] } | dump)
+              + ',"steps":' + ({ "total": ca.total or 0, "jira": ca.currentProduct or 0, "other": ca.everywhereElse or 0 } | dump)
+              + ',"rovo":' + ({ "total": cr.total or 0, "jira": cr.currentProduct or 0, "other": cr.everywhereElse or 0 } | dump) -%}
+          {%- set tail = ((',"billable":' + ({ "month": pd[2], "rules": bill } | dump)) if (not top._statusCode and not top._error) else "")
+              + ((',"limits":' + (lims | dump)) if lims.length else "")
+              + ((',"trend":' + (trend | dump)) if (not tr._statusCode and tr.data) else "")
+              + ((',"creditPack":' + ("true" if pack.hasCreditPack else "false")) if (not pack._statusCode and not pack._error) else "") -%}
+          {#- one chunk: keep the busiest rules if a huge site does not fit -#}
+          {%- set keep = [flows] -%}
+          {%- for t in range(0, 30) -%}
+            {%- set doc = '{"usage":' + head + ',"flows":' + (keep[0] | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
+            {%- if doc.length > LIMIT and keep[0].length -%}
+              {%- set _ = keep.splice(0, 1, (keep[0] | sort(true, false, "steps")).slice(0, ((keep[0].length * 3) // 4))) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set doc = '{"usage":' + head + ',"flows":' + (keep[0] | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
+          {%- set said = "" + (pushKind("usage", doc) | trim) -%}
+          {%- set _ = notes.push(("usage (beta) " + pd[2] + ": not taken, receiver answered " + said) if said else ("usage (beta) " + pd[2] + ": pushed " + (ca.total or 0) + " steps for " + keep[0].length + " rules")) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if uStop.length -%}{%- set _ = notes.push(uStop[0]) -%}{%- endif -%}
+{%- endif -%}
+
+{%- if RUNS and not shut -%}
+  {%- set days = (RUNS_DAYS if RUNS_DAYS >= 1 else 1) if RUNS_DAYS <= 30 else 30 -%}
+  {%- set startDay = dayNow - days -%}
+  {%- set startMs = startDay * 86400000 -%}
+  {%- set rStop = [] -%}
+  {%- set records = [] -%}
+  {%- set more = [1] -%}
+  {#- 50 a page whatever is asked; `total` is always 0 -#}
+  {%- for pg in range(0, RUNS_MAX_PAGES + 1) -%}
+    {%- if more.length and not rStop.length -%}
+      {%- if pg >= RUNS_MAX_PAGES -%}
+        {%- set _ = rStop.push("runs (beta) skipped: the audit log of " + days + " days is longer than " + RUNS_MAX_PAGES + " pages; set RUNS_DAYS lower") -%}
+      {%- else -%}
+        {%- set a = (INTERNAL + "auditlog") | callRest(verb="post", body={ "fromTime": (ymd(startDay) | trim) + "T00:00:00.000Z", "offset": pg * 50, "limit": 50 }, options=OPTS, dontFail=true) -%}
+        {%- if a._statusCode or a._error -%}
+          {%- set _ = rStop.push("runs (beta) skipped: auditlog answered " + (a._statusCode or "nothing")) -%}
+        {%- else -%}
+          {%- set got = (a.items.items if a.items else []) or [] -%}
+          {%- for x in got -%}{%- set _ = records.push(x) -%}{%- endfor -%}
+          {%- if got.length < 50 -%}{%- set _ = more.pop() -%}{%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if rStop.length -%}
+    {%- set _ = notes.push(rStop[0]) -%}
+  {%- else -%}
+    {#- per rule and UTC day; counters live in arrays, the one thing a template may change -#}
+    {%- set keys = [] -%}{%- set meta = [] -%}
+    {%- set cSucc = [] -%}{%- set cErr = [] -%}{%- set cNoop = [] -%}{%- set cEdit = [] -%}{%- set cMs = [] -%}{%- set cMax = [] -%}
+    {%- set cHour = [] -%}
+    {%- set failed = [] -%}
+    {%- for r in records -%}
+      {%- set t = r.eventTimestamp or r.startTime -%}
+      {%- if r.ruleIdUuid and t and t >= startMs -%}
+        {%- set day = ymd(t // 86400000) | trim -%}
+        {%- set k = r.ruleIdUuid + "|" + day -%}
+        {%- set at = keys.indexOf(k) -%}
+        {%- if at < 0 -%}
+          {%- set _ = keys.push(k) -%}
+          {%- set _ = meta.push({ "uuid": r.ruleIdUuid, "day": day, "name": r.ruleName or "" }) -%}
+          {%- set _ = cSucc.push(0) -%}{%- set _ = cErr.push(0) -%}{%- set _ = cNoop.push(0) -%}{%- set _ = cEdit.push(0) -%}{%- set _ = cMs.push(0) -%}{%- set _ = cMax.push(0) -%}
+          {%- for h in range(0, 24) -%}{%- if h < 24 -%}{%- set _ = cHour.push(0) -%}{%- endif -%}{%- endfor -%}
+          {%- set at = keys.length - 1 -%}
+        {%- endif -%}
+        {%- if r.category == "CONFIG_CHANGE" -%}
+          {%- set _ = cEdit.splice(at, 1, cEdit[at] + 1) -%}
+        {%- else -%}
+          {%- if r.category == "SUCCESS" -%}{%- set _ = cSucc.splice(at, 1, cSucc[at] + 1) -%}
+          {%- elif r.category == "NO_ACTIONS_PERFORMED" -%}{%- set _ = cNoop.splice(at, 1, cNoop[at] + 1) -%}
+          {%- else -%}{%- set _ = cErr.splice(at, 1, cErr[at] + 1) -%}
+            {%- if r.id -%}{%- set _ = failed.push({ "uuid": r.ruleIdUuid, "id": r.id, "at": r.eventTimestamp or 0 }) -%}{%- endif -%}
+          {%- endif -%}
+          {%- set hi = at * 24 + ((t % 86400000) // 3600000) -%}
+          {%- set _ = cHour.splice(hi, 1, cHour[hi] + 1) -%}
+          {%- set _ = cMs.splice(at, 1, cMs[at] + (r.durationMs or 0)) -%}
+          {%- if (r.durationMs or 0) > cMax[at] -%}{%- set _ = cMax.splice(at, 1, r.durationMs) -%}{%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {#- the failing component and the error code of up to two failed runs a rule, 40 in all -#}
+    {%- set errs = [] -%}
+    {%- set perRule = [] -%}
+    {%- set spent = [] -%}
+    {%- for f in (failed | sort(true, false, "at")) -%}
+      {%- if spent.length < 40 and (perRule | select("equalto", f.uuid) | list | length) < 2 -%}
+        {%- set _ = perRule.push(f.uuid) -%}
+        {%- set _ = spent.push(1) -%}
+        {%- set d = (INTERNAL + "auditlog/item/" + f.id) | callRest(options=OPTS, dontFail=true) -%}
+        {%- if not d._statusCode and not d._error and d.content -%}
+          {%- for cl in (d.content.componentLogs or []) -%}
+            {%- set res = cl.executionResult or {} -%}
+            {%- set ek = [] -%}
+            {%- for ch in (cl.changes or []) -%}{%- if ch.payload and ch.payload.type == "ERROR" and not ek.length -%}{%- set _ = ek.push(ch.payload.key or "") -%}{%- endif -%}{%- endfor -%}
+            {%- set code = (ek[0] if ek.length else "") or res.auditEventErrorType or res.errorType or "" -%}
+            {%- if code or res.state == "SOME_ERRORS" -%}
+              {%- set comp = cl.component or {} -%}
+              {%- set _ = errs.push({ "uuid": f.uuid, "componentId": comp.id or "", "componentType": comp.componentType or "",
+                                      "type": comp.type or "", "code": code or "SOME_ERRORS", "at": f.at }) -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {#- rows as JSON, the busiest first, as many as fit in one chunk -#}
+    {%- set order = [] -%}
+    {%- for i in range(0, keys.length) -%}{%- if i < keys.length -%}{%- set _ = order.push({ "i": i, "n": cSucc[i] + cErr[i] + cNoop[i] }) -%}{%- endif -%}{%- endfor -%}
+    {%- set rowsJson = [] -%}
+    {%- set size = [0] -%}
+    {%- set totals = [0, 0] -%}
+    {%- for o in (order | sort(true, false, "n")) -%}
+      {%- set i = o.i -%}
+      {%- set hp = [] -%}
+      {%- for h in range(0, 24) -%}{%- if h < 24 and cHour[i * 24 + h] -%}{%- set _ = hp.push('"' + h + '":' + cHour[i * 24 + h]) -%}{%- endif -%}{%- endfor -%}
+      {%- set one = '{"uuid":' + (meta[i].uuid | dump) + ',"day":"' + meta[i].day + '","name":' + (meta[i].name | dump)
+          + ',"success":' + cSucc[i] + ',"errors":' + cErr[i] + ',"noop":' + cNoop[i] + ',"edits":' + cEdit[i]
+          + ',"ms":' + cMs[i] + ',"maxMs":' + cMax[i] + (',"hours":{' + hp.join(",") + '}' if hp.length else "") + '}' -%}
+      {%- if size[0] + one.length < LIMIT - 4000 -%}
+        {%- set _ = rowsJson.push(one) -%}
+        {%- set _ = size.splice(0, 1, size[0] + one.length + 1) -%}
+        {%- set _ = totals.splice(0, 2, totals[0] + o.n, totals[1] + cErr[i]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set doc = '{"runs":{"window":' + ({ "start": startMs, "end": nowMs } | dump) + ',"rows":[' + rowsJson.join(",") + '],"errors":' + (errs | dump)
+        + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
+    {%- set said = "" + (pushKind("runs", doc) | trim) -%}
+    {%- set _ = notes.push(("runs (beta): not taken, receiver answered " + said) if said else ("runs (beta) last " + days + " days: pushed " + totals[0] + " runs, " + totals[1] + " with errors")) -%}
+  {%- endif -%}
+{%- endif -%}
+automap-sync {{ NAME }} {{ VERSION }}: {{ ids.length }} rules, {{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else "pushed, the map is rebuilding" }}{{ ("; " + notes.join("; ")) if notes.length else "" }}

@@ -34,10 +34,10 @@ All of them read the same settings, send the same thing and exit the same way.
 `--dry-run` (PowerShell: `-DryRun`; ScriptRunner: `AUTOMAP_DRY_RUN=1`) reads everything and
 pushes nothing — a safe first test of the Atlassian side.
 
-## Usage and runs (beta, Python and the image, from 1.1.0)
+## Usage and runs (beta, every sender from 1.1.0)
 
-On the Advanced edition the Python sender, and the image that runs it, also push two
-things after the rules, each as a separate push:
+On the Advanced edition every sender also pushes two things after the rules, each as a
+separate push:
 
 - **Usage**: this month's steps, Rovo credits and flow runs per rule, read from the same
   API Jira's *Usage* tab uses. Account ids it returns are dropped.
@@ -47,7 +47,10 @@ things after the rules, each as a separate push:
 
 Both read an internal Atlassian API that is not documented and can change. If either
 fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=off` and
-`AUTOMAP_RUNS=off` switch them off. The other senders push the rules only.
+`AUTOMAP_RUNS=off` switch them off; in JMWE they are the template values `USAGE` and
+`RUNS`. ScriptRunner reads the audit log only while its run has time left, and JMWE reads
+at most `RUNS_MAX_PAGES` pages of it: past that the runs are skipped, not sent in part, and
+`AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix.
 
 ## Exit codes
 

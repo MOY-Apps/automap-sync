@@ -207,7 +207,7 @@ not do this for you — every completed run is a build).
 
 ## 6a. Usage (beta)
 
-From sender 1.1.0 (Python first), a run also reads the site's **automation usage** — the
+From sender 1.1.0 — every sender: Python and the image, Node.js, bash, PowerShell, ScriptRunner and JMWE (APPS-487) — a run also reads the site's **automation usage** — the
 steps, Rovo credits and flow runs of the month, as Jira's own Usage tab shows them — and
 pushes it as a **second, separate push**. The numbers come from an undocumented internal
 Automation API ([automation-usage-api.md](automation-usage-api.md)) that only a personal
@@ -259,6 +259,14 @@ From the same sender version, a run also reads the **audit log** of the last
 ([automation-audit-log-api.md](automation-audit-log-api.md)) — folds it on the customer's
 side and pushes it as a **third push**, `X-Automap-Kind: runs`, one chunk, with the same
 rules as usage: never fails the run, spends no load, `AUTOMAP_RUNS=off` switches it off.
+
+Inside Jira the two app-hosted senders work within their host's limits. **ScriptRunner**
+reads the audit log only while the job has time left (200 s of the run) and skips the runs,
+rather than sending some days of them, when it does not fit — `AUTOMAP_RUNS_DAYS` lower is
+the answer. **JMWE** takes its switches as template values (`USAGE`, `RUNS`, `RUNS_DAYS`),
+reads at most `RUNS_MAX_PAGES` (60) pages of the audit log, proves each push by
+`X-Automap-Length` as it does the rules, and keeps every usage or runs push to one chunk of
+80 000 characters, the busiest rules first.
 
 What travels is counts and codes, nothing else: per rule and UTC day how many runs
 succeeded, failed, did nothing (`NO_ACTIONS_PERFORMED`) or were edits (`CONFIG_CHANGE`),

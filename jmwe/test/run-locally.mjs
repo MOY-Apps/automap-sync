@@ -91,6 +91,11 @@ export function filled() {
     if (!t.includes(from)) throw new Error(`placeholder ${from} not found in the template`);
     t = t.replace(from, to);
   }
+  // the switches the other senders take from the environment: AUTOMAP_USAGE, AUTOMAP_RUNS, AUTOMAP_RUNS_DAYS
+  const isOff = (k) => ['off', '0', 'false', 'no'].includes(String(process.env[k] || '').toLowerCase());
+  if (isOff('AUTOMAP_USAGE')) t = t.replace('{%- set USAGE = true -%}', '{%- set USAGE = false -%}');
+  if (isOff('AUTOMAP_RUNS')) t = t.replace('{%- set RUNS = true -%}', '{%- set RUNS = false -%}');
+  if (/^\d+$/.test(process.env.AUTOMAP_RUNS_DAYS || '')) t = t.replace('{%- set RUNS_DAYS = 7 -%}', `{%- set RUNS_DAYS = ${process.env.AUTOMAP_RUNS_DAYS} -%}`);
   return t;
 }
 

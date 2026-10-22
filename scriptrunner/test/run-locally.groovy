@@ -20,10 +20,10 @@ try {
 } catch (Throwable e) {
   def m = (e.message ?: '') =~ /^\[(\d)\]\s*(.*)$/
   if (m.find()) {
-    System.err.println("automap-sync scriptrunner 1.0.0: ${m.group(2)}")
+    System.err.println("automap-sync scriptrunner: ${m.group(2)}")
     System.exit(m.group(1).toInteger())
   }
-  System.err.println("automap-sync scriptrunner 1.0.0: failed: ${e}")
+  System.err.println("automap-sync scriptrunner: failed: ${e}")
   System.exit(6)
 } finally {
   Unirest.shutDown()

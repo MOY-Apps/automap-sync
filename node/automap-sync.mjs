@@ -8,7 +8,15 @@
  * docs/push-sync.md. Same environment, flags and exit codes as the Python sender:
  *
  *   ATLASSIAN_SITE | ATLASSIAN_CLOUD_ID, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN,
- *   AUTOMAP_URL, AUTOMAP_KEY; optional AUTOMAP_CHUNK_BYTES (200000), ATLASSIAN_API_BASE
+ *   AUTOMAP_URL, AUTOMAP_KEY; optional AUTOMAP_CHUNK_BYTES (200000), ATLASSIAN_API_BASE,
+ *   AUTOMAP_USAGE=off, AUTOMAP_RUNS=off, AUTOMAP_RUNS_DAYS (7)
+ *
+ * Usage and runs (BETA, from 1.1.0), as in the Python sender: after the rules, this month's
+ * steps, Rovo credits and flow runs per rule, and the audit log of the last
+ * AUTOMAP_RUNS_DAYS days folded into per-rule, per-day counts, are read from the internal
+ * API behind Jira's Usage and Audit log tabs and pushed as two separate pushes. That API is
+ * undocumented and can change: a failure there is logged and never fails the run. No account
+ * ids, no issue ids and no message text leave this machine.
  *
  *   node automap-sync.mjs [--dry-run]
  *
@@ -20,7 +28,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 const NAME = 'node';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const UA = `automap-sync-${NAME}/${VERSION}`;
 const EXIT = { config: 2, atlassian: 3, refused: 4, later: 5, failed: 6 };
 const REFUSED = new Set([400, 401, 402, 403, 404, 405, 413, 426]);
@@ -86,6 +94,7 @@ async function atlassian() {
 
   const ids = [];
   const seen = new Set();
+  const ctx = { auth, api, cloud };
   let cursor = null;
   let pages = 0;
   do {
@@ -107,7 +116,220 @@ async function atlassian() {
     const detail = await get(`/rule/${encodeURIComponent(id)}`);
     rules.push({ rule: detail && detail.rule ? detail.rule : detail });
   }
-  return rules;
+  return { rules, ctx };
+}
+
+const off = (name) => ['off', '0', 'false', 'no'].includes(String(process.env[name] || '').toLowerCase());
+const internal = (ctx) => `${ctx.api}/automation/internal-api/jira/${ctx.cloud}/pro/rest/GLOBAL/`;
+
+/** Automation usage (BETA) from the internal API behind Jira's Usage tab; account ids are not copied. */
+class Usage {
+  constructor(ctx) { this.ctx = ctx; this.base = internal(ctx); }
+
+  async get(path) {
+    const res = await request('GET', this.base + path, { Authorization: this.ctx.auth, Accept: 'application/json' });
+    if (res.status !== 200) throw new Error(`${path.split('?')[0]} answered ${res.status}`);
+    return JSON.parse(res.text);
+  }
+
+  async flows(start, end) {
+    const byRule = new Map();
+    // sortBy also filters to rules with that metric above zero: read both and merge
+    for (const sortBy of ['automationCredits', 'rovoCredits']) {
+      let seen = 0;
+      for (let page = 0; page < 100; page += 1) {
+        const r = await this.get(`highUsageFlows?limit=100&page=${page}&sortBy=${sortBy}&startTime=${start}&endTime=${end}`);
+        for (const f of r.flows || []) {
+          if (!f.ruleUuid) continue;
+          byRule.set(f.ruleUuid, {
+            uuid: f.ruleUuid, name: f.ruleName || '', state: f.state || 'ENABLED',
+            runs: f.runs || 0, steps: f.automationCredits || 0, rovo: f.rovoCredits || 0,
+            deleted: !!f.deleted, agentic: !!f.containsAgentic,
+          });
+        }
+        seen += (r.flows || []).length;
+        if (!(r.flows || []).length || seen >= (r.totalCount || 0)) break;
+      }
+    }
+    return [...byRule.values()];
+  }
+
+  async month(start, end, month) {
+    const credit = await this.get(`creditUsage?startTime=${start}&endTime=${end}`);
+    const pair = (c) => ({ total: (c || {}).total || 0, jira: (c || {}).currentProduct || 0, other: (c || {}).everywhereElse || 0 });
+    const out = { period: { start, end }, steps: pair(credit.automation), rovo: pair(credit.rovo), flows: await this.flows(start, end) };
+    // the rest is the current billing model, and the least stable part: each piece optional
+    try {
+      const top = await this.get(`highestUsages?limit=100&month=${month}`);
+      out.billable = { month, rules: top.filter((t) => t.ruleIdUuid).map((t) => ({ uuid: t.ruleIdUuid, runs: t.executionCount || 0 })) };
+    } catch { /* optional */ }
+    try {
+      const ws = (((await this.get('pagecontext')).tenantPageContext || {}).usage || {}).workspaceUsages || {};
+      out.limits = Object.entries(ws).map(([k, v]) => ({ product: k, used: v.executionsUsed || 0, limit: v.executionLimit || 0, edition: v.edition || '' }));
+    } catch { /* optional */ }
+    try {
+      out.trend = ((await this.get('usageTrendData')).data || []).map((t) => ({ month: t.month, runs: t.workspaceCounts || {} }));
+    } catch { /* optional */ }
+    try {
+      out.creditPack = !!(await this.get('hasCreditPack')).hasCreditPack;
+    } catch { /* optional */ }
+    return out;
+  }
+
+  /** This month so far; and in its first three days the whole of the month before. */
+  static periods(nowMs) {
+    const now = new Date(nowMs);
+    const y = now.getUTCFullYear();
+    const m = now.getUTCMonth();
+    const start = Date.UTC(y, m, 1);
+    const label = (yy, mm) => `${yy}-${String(mm + 1).padStart(2, '0')}`;
+    const out = [[start, nowMs, label(y, m)]];
+    if (now.getUTCDate() <= 3) {
+      const [py, pm] = m > 0 ? [y, m - 1] : [y - 1, 11];
+      out.unshift([Date.UTC(py, pm, 1), start - 1, label(py, pm)]);
+    }
+    return out;
+  }
+}
+
+/** The audit log (BETA), folded into what the map needs. Undocumented, like Usage. */
+class Runs {
+  constructor(ctx) { this.ctx = ctx; this.base = internal(ctx); }
+
+  async call(path, body) {
+    const headers = { Authorization: this.ctx.auth, Accept: 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    let status = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const res = await request(body !== undefined ? 'POST' : 'GET', this.base + path, headers,
+        body !== undefined ? JSON.stringify(body) : undefined);
+      status = res.status;
+      if (status === 200) return JSON.parse(res.text);
+      if (status !== null && status !== 429 && status < 500) break;
+      await sleep(2000 * attempt);
+    }
+    throw new Error(`${path.split('?')[0]} answered ${status}`);
+  }
+
+  static day(ms) { return new Date(ms).toISOString().slice(0, 10); }
+
+  async read(days, nowMs) {
+    let start = nowMs - days * 86400000;
+    start -= start % 86400000;          // whole days, so a day pushed is a day complete
+    const records = [];
+    for (let offset = 0; offset < 50000; offset += 50) {   // 50 a page whatever is asked; `total` is always 0
+      const page = ((await this.call('auditlog', { fromTime: new Date(start).toISOString(), offset, limit: 50 })).items || {}).items || [];
+      records.push(...page);
+      if (page.length < 50) break;
+    }
+    const rows = new Map();
+    const failed = new Map();
+    for (const r of records) {
+      const u = r.ruleIdUuid;
+      const t = r.eventTimestamp || r.startTime;
+      if (!u || !t || t < start) continue;
+      const key = `${u}|${Runs.day(t)}`;
+      if (!rows.has(key)) {
+        rows.set(key, { uuid: u, day: Runs.day(t), name: r.ruleName || '', success: 0, errors: 0, noop: 0, edits: 0, ms: 0, maxMs: 0 });
+      }
+      const row = rows.get(key);
+      const cat = r.category;
+      if (cat === 'CONFIG_CHANGE') { row.edits += 1; continue; }
+      row[cat === 'SUCCESS' ? 'success' : cat === 'NO_ACTIONS_PERFORMED' ? 'noop' : 'errors'] += 1;
+      // runs per UTC hour, only the hours that had any: a burst is hundreds of runs in one hour
+      const hour = String(new Date(t).getUTCHours());
+      row.hours = row.hours || {};
+      row.hours[hour] = (row.hours[hour] || 0) + 1;
+      const ms = r.durationMs || 0;
+      row.ms += ms;
+      row.maxMs = Math.max(row.maxMs, ms);
+      if (cat !== 'SUCCESS' && cat !== 'NO_ACTIONS_PERFORMED' && r.id) {
+        if (!failed.has(u)) failed.set(u, []);
+        failed.get(u).push(r);
+      }
+    }
+    const errors = [];
+    let budget = 40;                    // one request per failed run read in full; two per rule at most
+    for (const [u, list] of failed) {
+      for (const r of list.sort((a, b) => (b.eventTimestamp || 0) - (a.eventTimestamp || 0)).slice(0, 2)) {
+        if (budget <= 0) break;
+        budget -= 1;
+        let detail;
+        try { detail = await this.call(`auditlog/item/${r.id}`); } catch { continue; }
+        for (const cl of (detail.content || {}).componentLogs || []) {
+          const res = cl.executionResult || {};
+          const keys = (cl.changes || []).filter((ch) => (ch.payload || {}).type === 'ERROR').map((ch) => (ch.payload || {}).key || '');
+          const code = (keys[0] || '') || res.auditEventErrorType || res.errorType || '';
+          if (!code && res.state !== 'SOME_ERRORS') continue;
+          const comp = cl.component || {};
+          errors.push({ uuid: u, componentId: comp.id || '', componentType: comp.componentType || '',
+            type: comp.type || '', code: code || 'SOME_ERRORS', at: r.eventTimestamp || 0 });
+        }
+      }
+    }
+    return { window: { start, end: nowMs }, rows: [...rows.values()], errors };
+  }
+}
+
+/** One push of one chunk with its kind; usage and runs are each a push of their own. */
+async function pushKind(kind, payload) {
+  const data = Buffer.from(payload, 'ascii');
+  return request('POST', env('AUTOMAP_URL'), {
+    Authorization: `Bearer ${env('AUTOMAP_KEY')}`, 'Content-Type': 'text/plain; charset=utf-8',
+    'X-Automap-Run': randomUUID().replace(/-/g, ''), 'X-Automap-Seq': '0', 'X-Automap-Last': '1',
+    'X-Automap-Sha256': createHash('sha256').update(data).digest('hex'), 'X-Automap-Sender': `${NAME}/${VERSION}`,
+    'X-Automap-Kind': kind,
+  }, data);
+}
+
+/** Read and push the usage; a failure is logged and the run goes on. */
+async function pushUsage(ctx, dryRun) {
+  if (off('AUTOMAP_USAGE')) return;
+  try {
+    const u = new Usage(ctx);
+    for (const [start, end, month] of Usage.periods(Date.now())) {
+      const doc = { usage: await u.month(start, end, month), sender: { name: NAME, version: VERSION } };
+      let payload = asciiJson(doc);
+      // one chunk: keep the busiest rules if a huge site does not fit
+      while (payload.length > 250000 && doc.usage.flows.length) {
+        doc.usage.flows = doc.usage.flows.sort((a, b) => b.steps - a.steps).slice(0, Math.floor(doc.usage.flows.length * 3 / 4));
+        payload = asciiJson(doc);
+      }
+      const steps = doc.usage.steps.total;
+      const rules = doc.usage.flows.length;
+      if (dryRun) { log(`usage (beta) ${month}: ${steps} steps, ${rules} rules with usage; nothing pushed`); continue; }
+      const res = await pushKind('usage', payload);
+      if (res.status === 202) log(`usage (beta) ${month}: pushed ${steps} steps for ${rules} rules`);
+      else log(`usage (beta) ${month}: not taken, receiver answered ${res.status} ${word(res.text)}`);
+    }
+  } catch (err) {
+    log(`usage (beta) skipped: ${err && err.message}`);
+  }
+}
+
+/** Read the audit log and push it folded; a failure is logged and the run goes on. */
+async function pushRuns(ctx, dryRun) {
+  if (off('AUTOMAP_RUNS')) return;
+  try {
+    const days = Math.max(1, Math.min(30, Number(process.env.AUTOMAP_RUNS_DAYS) || 7));
+    const runs = await new Runs(ctx).read(days, Date.now());
+    const doc = { runs, sender: { name: NAME, version: VERSION } };
+    let payload = asciiJson(doc);
+    const total = (rows) => rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0);
+    while (payload.length > 250000 && runs.rows.length) {
+      runs.rows = runs.rows.sort((a, b) => (b.success + b.errors + b.noop) - (a.success + a.errors + a.noop))
+        .slice(0, Math.floor(runs.rows.length * 3 / 4));
+      payload = asciiJson(doc);
+    }
+    const all = total(runs.rows);
+    const failed = runs.rows.reduce((n, x) => n + x.errors, 0);
+    if (dryRun) { log(`runs (beta) last ${days} days: ${all} runs, ${failed} with errors; nothing pushed`); return; }
+    const res = await pushKind('runs', payload);
+    if (res.status === 202) log(`runs (beta) last ${days} days: pushed ${all} runs, ${failed} with errors`);
+    else log(`runs (beta): not taken, receiver answered ${res.status} ${word(res.text)}`);
+  } catch (err) {
+    log(`runs (beta) skipped: ${err && err.message}`);
+  }
 }
 
 /** Compact JSON with every non-ASCII code unit escaped, so a byte split is a safe split. */
@@ -172,8 +394,22 @@ async function push(payload, dryRun) {
 async function main(argv) {
   const dryRun = argv.includes('--dry-run') || process.env.AUTOMAP_DRY_RUN === '1';
   try {
-    const rules = await atlassian();
-    await push(asciiJson({ rules, sender: { name: NAME, version: VERSION, rules: rules.length } }), dryRun);
+    const { rules, ctx } = await atlassian();
+    let stopped = null;
+    try {
+      await push(asciiJson({ rules, sender: { name: NAME, version: VERSION, rules: rules.length } }), dryRun);
+    } catch (err) {
+      if (!(err instanceof Stop)) throw err;
+      stopped = err;
+    }
+    // usage is a push of its own and spends no load, so it goes even when the rules were
+    // refused (an allowance used up, say); it never changes the exit code - but not when the
+    // receiver shut the door (403: switched off, or not on this plan)
+    if (!(stopped && stopped.code === EXIT.refused && stopped.message.includes('403'))) {
+      await pushUsage(ctx, dryRun);
+      await pushRuns(ctx, dryRun);
+    }
+    if (stopped) throw stopped;
     return 0;
   } catch (err) {
     if (err instanceof Stop) { log(err.message); return err.code; }
