@@ -353,6 +353,12 @@ test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map
       assert.match(r.out, /^automap-sync jmwe 1\.4\.0: failed - \[2\] PART must be/, `PART=${bad}: ${r.out}`);
       assert.equal(site.state.apiCalls.length, calls, `PART=${bad}: nothing read`);
     }
+    // so is a JMWE without a clock: a part cannot name its day, and must not push as 1970's
+    const calls = site.state.apiCalls.length;
+    const noClock = await runJmwe(site, { PART: '1/2', JMWE_NO_CLOCK: '1' });
+    assert.match(noClock.out, /^automap-sync jmwe 1\.4\.0: failed - \[2\] no clock \(now\): parts need the UTC date/, noClock.out);
+    assert.equal(site.state.apiCalls.length, calls, 'nothing read without a clock');
+    assert.ok(!site.state.requests.some((r) => r.run === 'd19700101'), 'no push under 1970');
     // without PART nothing changes on the wire
     const plain = await startFakeSite({ rules: makeRules(3), flaky: false });
     try {

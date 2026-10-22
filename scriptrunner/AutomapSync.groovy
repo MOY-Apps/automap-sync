@@ -49,7 +49,9 @@
  * the last half of the day has arrived. Three jobs are 1/3, 2/3, 3/3, up to 20. The
  * limit is honest: each copy must finish within ScriptRunner's time limit; raise M until
  * it does. The slices are cut by rule id, so a rule made between the two jobs may be
- * missed until the next day.
+ * missed until the next day. The copies find each other by the UTC date they start on,
+ * so schedule them inside the same UTC day - e.g. 01:00 and 02:00 UTC - never either
+ * side of 00:00 UTC.
  *
  * Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
  */
@@ -97,6 +99,9 @@ if (partText) {
   }
 }
 String part = partM ? "${partN}/${partM}".toString() : ''
+// parts of one day share the run: the UTC date, stamped now rather than after the minutes
+// of reading, so copies started on the same side of 00:00 UTC agree on it
+String dayRun = 'd' + new Date().format('yyyyMMdd', TimeZone.getTimeZone('UTC'))
 
 String auth = 'Basic ' + "${cfg('ATLASSIAN_EMAIL')}:${cfg('ATLASSIAN_API_TOKEN')}".bytes.encodeBase64().toString()
 String api = cfg('ATLASSIAN_API_BASE', 'https://api.atlassian.com').replaceAll('/$', '')
@@ -201,8 +206,7 @@ def pushRules = { ->
   String url = cfg('AUTOMAP_URL')
   String key = cfg('AUTOMAP_KEY')
   for (int attempt = 1; attempt <= 2; attempt++) {
-    // parts of one day share the run: the UTC date, so independent jobs agree on it
-    String run = part ? 'd' + new Date().format('yyyyMMdd', TimeZone.getTimeZone('UTC')) : UUID.randomUUID().toString().replace('-', '')
+    String run = part ? dayRun : UUID.randomUUID().toString().replace('-', '')
     boolean restart = false
     boolean queued = false
     for (int seq = 0; seq < chunks.size(); seq++) {

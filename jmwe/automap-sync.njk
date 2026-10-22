@@ -22,6 +22,8 @@
   of the day has arrived. Three are "1/3", "2/3", "3/3", up to 20. The limit is honest:
   each copy must finish within JMWE's time limit; raise M until it does. The slices are
   cut by rule id, so a rule made between the two actions may be missed until the next day.
+  The copies find each other by the UTC date they start on, so schedule them inside the
+  same UTC day - e.g. 01:00 and 02:00 UTC - never either side of 00:00 UTC.
 
   This is the first of two templates. automap-usage.njk, a Scheduled action of its own,
   pushes this month's usage and the audit log (beta, Advanced edition), so each gets a
@@ -50,8 +52,28 @@
 {%- set partM = (pp[1] | int) if pp.length == 2 else 0 -%}
 {%- set partOk = (not PART) or (pp.length == 2 and ("" + partN) == pp[0] and ("" + partM) == pp[1] and partM >= 2 and partM <= 20 and partN >= 1 and partN <= partM) -%}
 {%- set part = (partN + "/" + partM) if (partOk and PART) else "" -%}
+
+{#- parts of one day share the run: the UTC date, worked out from the clock without a date
+    library - and stamped now, before the minutes of reading, so copies started on the same
+    side of 00:00 UTC agree on it. Without a clock a part cannot name its day -#}
+{%- macro ymd(days) -%}
+{%- set z = days + 719468 -%}
+{%- set era = z // 146097 -%}
+{%- set doe = z - era * 146097 -%}
+{%- set yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365 -%}
+{%- set doy = doe - (365 * yoe + yoe // 4 - yoe // 100) -%}
+{%- set mp = (5 * doy + 2) // 153 -%}
+{%- set dd = doy - (153 * mp + 2) // 5 + 1 -%}
+{%- set mm = (mp + 3) if mp < 10 else (mp - 9) -%}
+{%- set yy = yoe + era * 400 + (1 if mm <= 2 else 0) -%}
+{{- yy }}{{ ("0" if mm < 10 else "") + mm }}{{ ("0" if dd < 10 else "") + dd -}}
+{%- endmacro -%}
+{%- set nowMs = (now | date("x") if now else "0") | int -%}
+{%- set dayRun = ("d" + (ymd(nowMs // 86400000) | trim)) if (part and nowMs) else "" -%}
 {%- if not partOk -%}
 automap-sync {{ NAME }} {{ VERSION }}: failed - [2] PART must be "N/M" with 1 <= N <= M <= 20 (e.g. "1/2"), or "", not "{{ PART }}"
+{%- elif part and not nowMs -%}
+automap-sync {{ NAME }} {{ VERSION }}: failed - [2] no clock (now): parts need the UTC date
 {%- else -%}
 
 {#- 1. the cloud id, then every rule id, page by page -#}
@@ -102,22 +124,8 @@ automap-sync {{ NAME }} {{ VERSION }}: failed - [2] PART must be "N/M" with 1 <=
   {%- endif -%}
 {%- endfor -%}
 
-{#- 4. push: one run id, chunks in order, the length on the last one. Parts of one day share
-    the run: the UTC date, worked out from the clock without a date library -#}
-{%- macro ymd(days) -%}
-{%- set z = days + 719468 -%}
-{%- set era = z // 146097 -%}
-{%- set doe = z - era * 146097 -%}
-{%- set yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365 -%}
-{%- set doy = doe - (365 * yoe + yoe // 4 - yoe // 100) -%}
-{%- set mp = (5 * doy + 2) // 153 -%}
-{%- set dd = doy - (153 * mp + 2) // 5 + 1 -%}
-{%- set mm = (mp + 3) if mp < 10 else (mp - 9) -%}
-{%- set yy = yoe + era * 400 + (1 if mm <= 2 else 0) -%}
-{{- yy }}{{ ("0" if mm < 10 else "") + mm }}{{ ("0" if dd < 10 else "") + dd -}}
-{%- endmacro -%}
-{%- set nowMs = (now | date("x") if now else "0") | int -%}
-{%- set run = ("d" + (ymd(nowMs // 86400000) | trim)) if part else (NAME + "-" + text.length + "-" + ids.length + "-" + nowMs) -%}
+{#- 4. push: one run id (a part's is the day's, stamped above), chunks in order, the length on the last one -#}
+{%- set run = dayRun if part else (NAME + "-" + text.length + "-" + ids.length + "-" + nowMs) -%}
 {%- set failures = [] -%}
 {%- set queued = [] -%}
 {%- set count = bounds.length - 1 -%}

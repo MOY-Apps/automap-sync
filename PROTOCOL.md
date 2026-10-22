@@ -178,13 +178,19 @@ document the build reads, and builds once.
   `400 bad-request`, as is the header on usage or runs. `M` is the same on every part of
   the group (`409 conflict` otherwise).
 - **One run id for the group.** Jobs that cannot talk to each other agree on it by the
-  date: our senders use `d<YYYYMMDD>` in UTC (`d20261023`). The receiver asks only that it
-  is a run id.
+  date: our senders use `d<YYYYMMDD>` in UTC (`d20261023`), stamped when the job starts,
+  before the minutes of reading. So schedule the copies inside the same UTC day - e.g.
+  01:00 and 02:00 UTC, not either side of 00:00 UTC - or they name different days and
+  neither group completes. The receiver asks only that it is a run id.
 - **Staged apart, built together.** Part N is staged under `push-<run>-p<N>`; chunk 0 of a
   part clears that part - a resent part replaces itself. The group's `builds` row,
   `push-<run>`, is opened by whichever part's chunk 0 comes first, and the load allowance is
   checked there once: the parts are **one load**. A part for a group whose build is already
-  queued is `409 conflict`, as a reused run is.
+  queued is `409 conflict`, as a reused run is. Each proven part has a mark of its own
+  (`push_part:<run>:<n>`), and when a last chunk finds every mark in place it claims the
+  merge with one conditional update of the group's row (`stage = 'merge'`): two parts
+  finishing in the same instant both see every mark, exactly one wins the row and builds,
+  the other answers `accepted`.
 - **Answers.** The last chunk of a part is `202 accepted` while parts are missing, and
   `202 queued` when it completed the group. Parts may come in any order. A part whose proof
   fails is `422 checksum` and that part alone is dropped - the group and its other parts
@@ -195,10 +201,12 @@ document the build reads, and builds once.
   group, and `"parts": M` added. The document is written compact and ASCII under
   `push-<run>` in chunks of 200 KB, the parts' chunks go, and the build is queued exactly
   as for a plain push. The settings page says "in M parts".
-- **24 hours.** A group still staging a day after it opened was abandoned (the other job
-  never came): the next chunk 0 of any of its parts starts it over - the stale parts go,
-  the allowance is checked again, a new load. Nothing sweeps in the background; an
-  abandoned group costs nothing until a part comes.
+- **24 hours.** A group still open a day after it began was abandoned (the other job
+  never came). Whatever looks first - any part push, or the settings page - drops its
+  parts' chunks and marks, fails its build row ("Not every part of this push arrived
+  within a day, so nothing was loaded. The previous map is still in place."), and the
+  card says so; the run id is closed from then on, as a failed run's is (`409`), and the
+  next day's run opens a new group, a new load. Nothing sweeps in the background.
 
 ### Answers
 

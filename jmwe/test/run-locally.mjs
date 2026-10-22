@@ -74,7 +74,8 @@ export function render(templateText) {
   const e = new nunjucks.Environment(null, { autoescape: false });
   e.addFilter('callRest', (url, kw) => callRest(url, kw || {}));
   e.addFilter('date', (value, fmt) => (fmt === 'x' ? String(new Date(value || Date.now()).getTime()) : new Date(value || Date.now()).toISOString()));
-  e.addGlobal('now', new Date());
+  // JMWE_NO_CLOCK=1: a JMWE without the `now` global, which a part must refuse to run on
+  if (process.env.JMWE_NO_CLOCK !== '1') e.addGlobal('now', new Date());
   return e.renderString(templateText, {});
 }
 

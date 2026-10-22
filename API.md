@@ -189,7 +189,9 @@ parts and builds once.
 - Each part is a push exactly as above: its own chunks from `X-Automap-Seq: 0`, its own
   proof on its last chunk, the same document shape (just fewer rules). Reuse your chunk code.
 - All parts of one build share the **run id**. Jobs that cannot talk to each other agree on
-  it by the date: our senders use `d<YYYYMMDD>` in UTC, `d20261023`.
+  it by the date: our senders use `d<YYYYMMDD>` in UTC, `d20261023`, stamped when the job
+  starts. Schedule the copies inside the same UTC day - e.g. 01:00 and 02:00 UTC, not either
+  side of 00:00 UTC - or they name different days and neither group completes.
 - `N/M` is the same on every chunk of the part; `M` is the same on every part. A part with
   another `M` is `409`.
 - The last chunk of a part is answered `202 accepted` while parts are missing, and
@@ -197,13 +199,14 @@ parts and builds once.
   load**, checked when its first chunk 0 arrives.
 - A part sent again (chunk 0 of a part already in) replaces that part. A part whose proof
   fails (`422`) is dropped alone; the others stay, send that part again.
-- A group not complete after **24 hours** is abandoned: the next chunk 0 of any of its parts
-  starts it over, as a new load.
+- A group not complete after **24 hours** is abandoned: its parts are dropped, nothing is
+  loaded, the settings page says so, and that run id is closed (`409`). The next day's run
+  id opens a new group, a new load.
 - Merging: the rules of every part, in part order, a rule in two parts kept once (the later
   part's copy; by `uuid`, or `id` without one), `sender` from the part that completed the
   group, and `"parts": M` added. Usage and runs do not come in parts (`400`).
 
-Two parts with curl, each a document of its own, an hour apart or at once:
+Two parts with curl, each a document of its own, an hour apart:
 
 ```bash
 for PART in 1 2; do
