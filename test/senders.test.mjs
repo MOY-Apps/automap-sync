@@ -143,6 +143,8 @@ for (const s of SENDERS) {
     assert.deepEqual(u.limits, [{ product: 'JIRA_SERVICE_MANAGEMENT', used: 18, limit: 3000, edition: 'premium' }]);
     assert.ok(!JSON.stringify(site.state.pushed.usage).includes('secret'), 'no account id leaves the sender');
     assert.match(out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+    // with AUTOMAP_CHUNK_BYTES at 900, usage and runs go in several chunks like the rules (APPS-499)
+    assert.ok(site.state.extraChunks > site.state.pushed.usage.length + site.state.pushed.runs.length, `${s.name}: usage and runs in several chunks`);
 
     // runs (beta): counted per rule and day, the failing component by code - and nothing else
     assert.ok(site.state.pushed.runs.length >= 1, out);
@@ -191,7 +193,7 @@ for (const s of SENDERS) {
 // It needs the nunjucks package (NUNJUCKS_DIR, a folder with node_modules/nunjucks).
 const nunjucksDir = process.env.NUNJUCKS_DIR;
 function runJmwe(site, extraEnv = {}) {
-  const envv = { ...process.env, ...site.env, ATLASSIAN_SITE: site.env.ATLASSIAN_API_BASE, NUNJUCKS_DIR: nunjucksDir, ...extraEnv };
+  const envv = { ...process.env, ...site.env, ATLASSIAN_SITE: site.env.ATLASSIAN_API_BASE, NUNJUCKS_DIR: nunjucksDir, AUTOMAP_CHUNK_BYTES: '300', ...extraEnv };
   // spawn, not spawnSync: the fake site answers from this very process
   return new Promise((resolve) => {
     const child = spawn('node', [join(root, 'jmwe/test/run-locally.mjs')], { env: envv });
@@ -221,6 +223,7 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     assert.deepEqual(u.limits, [{ product: 'JIRA_SERVICE_MANAGEMENT', used: 18, limit: 3000, edition: 'premium' }]);
     assert.ok(!JSON.stringify(site.state.pushed.usage).includes('secret'), 'no account id leaves the template');
     assert.match(out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+    assert.ok(site.state.extraChunks > 2, 'jmwe: usage and runs in several chunks');
     const r = site.state.pushed.runs[site.state.pushed.runs.length - 1].runs;
     const a = r.rows.find((x) => x.uuid === rules[0].uuid);
     assert.deepEqual([a.success, a.errors, a.noop], [1, 1, 0]);

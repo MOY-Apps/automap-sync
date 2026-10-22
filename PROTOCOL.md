@@ -225,10 +225,12 @@ API token can read; Atlassian can change or close it without notice. So:
   internal API returns (`actorAccountId`, `authorAccountId`) are dropped by the sender, and
   the receiver keeps only the fields below whatever arrives.
 
-**Headers:** as any push, plus `X-Automap-Kind: usage`; one chunk (`X-Automap-Seq: 0`,
-`X-Automap-Last: 1`, `X-Automap-Sha256`), at most 256 KiB — a sender keeps the busiest rules
-if a huge site does not fit. Answers: `202 queued`, `400 bad-request` (not one whole chunk,
-not usage), `422 checksum`, and the key and rate answers of any push.
+**Headers:** as any push, plus `X-Automap-Kind: usage`. Chunked like the rules (from senders
+1.2.0, APPS-499): `X-Automap-Seq` 0, 1, … in order, `X-Automap-Last: 1` and `X-Automap-Sha256`
+(or `X-Automap-Length`) on the last; a small site is one chunk. Every rule goes, none is
+dropped: Advanced keeps every rule Atlassian lists (10,000 at most). Answers: `202 accepted`
+for a chunk, `202 queued` for the last, `409 conflict` for a chunk out of order, `400
+bad-request` (not usage), `422 checksum`, and the key and rate answers of any push.
 
 **Body:**
 
@@ -257,7 +259,7 @@ of the internal API most likely to change. The app keeps one snapshot per month
 From the same sender version, a run also reads the **audit log** of the last
 `AUTOMAP_RUNS_DAYS` days (7) — the internal API behind Jira's Audit log tab
 ([automation-audit-log-api.md](automation-audit-log-api.md)) — folds it on the customer's
-side and pushes it as a **third push**, `X-Automap-Kind: runs`, one chunk, with the same
+side and pushes it as a **third push**, `X-Automap-Kind: runs`, chunked like usage, with the same
 rules as usage: never fails the run, spends no load, `AUTOMAP_RUNS=off` switches it off.
 
 Inside Jira the two app-hosted senders come in two parts, each a job of its own with the
@@ -270,8 +272,8 @@ reads the audit log only while the job has time left (200 s of the run) and skip
 rather than sending some days of them, when it does not fit — `AUTOMAP_RUNS_DAYS` lower is
 the answer. **JMWE** takes its switches as template values (`USAGE`, `RUNS`, `RUNS_DAYS`),
 reads at most `RUNS_MAX_PAGES` (60) pages of the audit log, proves each push by
-`X-Automap-Length` as it does the rules, and keeps every usage or runs push to one chunk of
-80 000 characters, the busiest rules first.
+`X-Automap-Length` as it does the rules, and sends usage and runs in chunks of 80 000
+characters, every rule included.
 
 What travels is counts and codes, nothing else: per rule and UTC day how many runs
 succeeded, failed, did nothing (`NO_ACTIONS_PERFORMED`) or were edits (`CONFIG_CHANGE`),

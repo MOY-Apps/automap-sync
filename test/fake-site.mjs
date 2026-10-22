@@ -216,9 +216,20 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       // usage (beta): one chunk, checked and kept apart from the rules, like the real receiver
       const kind = String(h('x-automap-kind') || 'rules');
       if (kind === 'usage' || kind === 'runs') {
-        if (seq !== 0 || !last) return answer('bad-request');
-        if (sum && createHash('sha256').update(raw).digest('hex') !== sum) return answer('checksum');
-        state.pushed[kind].push(JSON.parse(raw.toString('utf8')));
+        // staged in order like the rules, kept whole on the last chunk (APPS-499)
+        const key = `${kind}|${run}`;
+        state.extra = state.extra || new Map();
+        if (seq === 0) state.extra.set(key, []);
+        const parts = state.extra.get(key);
+        if (!parts || seq > parts.length) return answer('conflict');
+        parts[seq] = raw;
+        state.extraChunks = (state.extraChunks || 0) + 1;
+        if (!last) return answer('accepted');
+        const whole = Buffer.concat(parts);
+        state.extra.delete(key);
+        if (sum && createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
+        if (lengthText && whole.toString('utf8').length !== Number(lengthText)) return answer('checksum');
+        state.pushed[kind].push(JSON.parse(whole.toString('utf8')));
         return answer('queued');
       }
 

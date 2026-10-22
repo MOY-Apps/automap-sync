@@ -34,7 +34,7 @@ param([switch]$DryRun)
 
 $ErrorActionPreference = 'Stop'
 $Name = 'powershell'
-$Version = '1.1.0'
+$Version = '1.2.0'
 $UA = "automap-sync-$Name/$Version"
 $Refused = @(400, 401, 402, 403, 404, 405, 413, 426)
 
@@ -202,20 +202,32 @@ function ConvertTo-AsciiJson($doc) {
   return [regex]::Replace($j, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 }
 
-# One push of one chunk with its kind; usage and runs are each a push of their own.
+# Usage or runs (beta), in chunks like the rules; the receiver keeps them whole on the last one (APPS-499).
 function Send-Kind([string]$kind, [string]$payload) {
   $bytes = [Text.Encoding]::ASCII.GetBytes($payload)
   $hash = -join ([Security.Cryptography.SHA256]::HashData($bytes) | ForEach-Object { $_.ToString('x2') })
-  $h = @{
-    Authorization      = "Bearer $(Get-Setting 'AUTOMAP_KEY')"
-    'X-Automap-Run'    = [Guid]::NewGuid().ToString('N')
-    'X-Automap-Seq'    = '0'
-    'X-Automap-Last'   = '1'
-    'X-Automap-Sha256' = $hash
-    'X-Automap-Sender' = "$Name/$Version"
-    'X-Automap-Kind'   = $kind
+  $size = [int](Get-Setting 'AUTOMAP_CHUNK_BYTES' '200000')
+  $parts = [System.Collections.Generic.List[byte[]]]::new()
+  for ($i = 0; $i -lt $bytes.Length; $i += $size) { $parts.Add($bytes[$i..([Math]::Min($i + $size, $bytes.Length) - 1)]) }
+  $run = [Guid]::NewGuid().ToString('N')
+  $r = @{ Status = 0; Text = '' }
+  for ($seq = 0; $seq -lt $parts.Count; $seq++) {
+    $h = @{
+      Authorization      = "Bearer $(Get-Setting 'AUTOMAP_KEY')"
+      'X-Automap-Run'    = $run
+      'X-Automap-Seq'    = [string]$seq
+      'X-Automap-Sender' = "$Name/$Version"
+      'X-Automap-Kind'   = $kind
+    }
+    if ($seq -eq $parts.Count - 1) { $h['X-Automap-Last'] = '1'; $h['X-Automap-Sha256'] = $hash }
+    for ($tries = 1; $tries -le 3; $tries++) {
+      $r = Invoke-Http 'POST' (Get-Setting 'AUTOMAP_URL') $h $parts[$seq]
+      if ($r.Status -ne 0 -and $r.Status -lt 500 -and $r.Status -ne 429) { break }
+      if ($tries -lt 3) { Start-Sleep -Seconds ([Math]::Pow(2, $tries)) }
+    }
+    if ($r.Status -ne 202) { break }
   }
-  return Invoke-Http 'POST' (Get-Setting 'AUTOMAP_URL') $h $bytes
+  return $r
 }
 
 # The internal API behind Jira's Usage and Audit log tabs (BETA, undocumented): throws on any
@@ -308,11 +320,6 @@ function Send-Usage {
       $u = Get-UsageMonth $pd[0] $pd[1] $pd[2]
       $doc = [ordered]@{ usage = $u; sender = [ordered]@{ name = $Name; version = $Version } }
       $payload = ConvertTo-AsciiJson $doc
-      # one chunk: keep the busiest rules if a huge site does not fit
-      while ($payload.Length -gt 250000 -and $u.flows.Count -gt 0) {
-        $u.flows = [object[]]@($u.flows | Sort-Object { - $_.steps } | Select-Object -First ([Math]::Floor($u.flows.Count * 3 / 4)))
-        $payload = ConvertTo-AsciiJson $doc
-      }
       $steps = $u.steps.total
       $n = $u.flows.Count
       if ($DryRun) { Write-Log "usage (beta) $($pd[2]): $steps steps, $n rules with usage; nothing pushed"; continue }
@@ -390,10 +397,6 @@ function Send-Runs {
     $runs = [ordered]@{ window = [ordered]@{ start = $start; end = $nowMs }; rows = [object[]]@($rows.Values); errors = [object[]]@($errors) }
     $doc = [ordered]@{ runs = $runs; sender = [ordered]@{ name = $Name; version = $Version } }
     $payload = ConvertTo-AsciiJson $doc
-    while ($payload.Length -gt 250000 -and $runs.rows.Count -gt 0) {
-      $runs.rows = [object[]]@($runs.rows | Sort-Object { - ($_.success + $_.errors + $_.noop) } | Select-Object -First ([Math]::Floor($runs.rows.Count * 3 / 4)))
-      $payload = ConvertTo-AsciiJson $doc
-    }
     $total = 0; $bad = 0
     foreach ($x in $runs.rows) { $total += $x.success + $x.errors + $x.noop; $bad += $x.errors }
     if ($DryRun) { Write-Log "runs (beta) last $days days: $total runs, $bad with errors; nothing pushed"; return }

@@ -47,7 +47,7 @@ import urllib.request
 import uuid
 
 NAME = "python"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UA = f"automap-sync-{NAME}/{VERSION}"
 
 EXIT_CONFIG, EXIT_ATLASSIAN, EXIT_REFUSED, EXIT_LATER, EXIT_FAILED = 2, 3, 4, 5, 6
@@ -319,6 +319,37 @@ class Runs:
         return {"window": {"start": start, "end": now_ms}, "rows": list(rows.values()), "errors": errors}
 
 
+def push_kind(kind, payload):
+    """Usage or runs (beta), in chunks like the rules; the receiver keeps them whole on the
+    last one (APPS-499). Returns the last answer's status and body."""
+    data = payload.encode("ascii")
+    checksum = hashlib.sha256(data).hexdigest()
+    size = int(env("AUTOMAP_CHUNK_BYTES", "200000"))
+    chunks = [data[i:i + size] for i in range(0, len(data), size)] or [b""]
+    run = uuid.uuid4().hex
+    status, body = None, b""
+    for seq, chunk in enumerate(chunks):
+        headers = {
+            "Authorization": f"Bearer {env('AUTOMAP_KEY')}", "Content-Type": "text/plain; charset=utf-8",
+            "X-Automap-Run": run, "X-Automap-Seq": str(seq), "X-Automap-Sender": f"{NAME}/{VERSION}",
+            "X-Automap-Kind": kind,
+        }
+        if seq == len(chunks) - 1:
+            headers["X-Automap-Last"] = "1"
+            headers["X-Automap-Sha256"] = checksum
+        for tries in range(1, 4):
+            try:
+                status, _, body = request("POST", env("AUTOMAP_URL"), headers, chunk)
+            except OSError as err:
+                status, body = None, str(err).encode()
+            if status in (202,) or (status is not None and status < 500 and status != 429) or tries == 3:
+                break
+            time.sleep(2 ** tries)
+        if status != 202:
+            break
+    return status, body
+
+
 def push_runs(atlassian, dry_run):
     """Read the audit log and push it folded; a failure is logged and the run goes on."""
     if os.environ.get("AUTOMAP_RUNS", "").lower() in ("off", "0", "false", "no"):
@@ -328,21 +359,12 @@ def push_runs(atlassian, dry_run):
         runs = Runs(atlassian).read(days, int(time.time() * 1000))
         doc = {"runs": runs, "sender": {"name": NAME, "version": VERSION}}
         payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
-        while len(payload) > 250000 and runs["rows"]:
-            runs["rows"] = sorted(runs["rows"], key=lambda x: -(x["success"] + x["errors"] + x["noop"]))[: len(runs["rows"]) * 3 // 4]
-            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
         total = sum(x["success"] + x["errors"] + x["noop"] for x in runs["rows"])
         failed = sum(x["errors"] for x in runs["rows"])
         if dry_run:
             log(f"runs (beta) last {days} days: {total} runs, {failed} with errors; nothing pushed")
             return
-        data = payload.encode("ascii")
-        status, _, body = request("POST", env("AUTOMAP_URL"), {
-            "Authorization": f"Bearer {env('AUTOMAP_KEY')}", "Content-Type": "text/plain; charset=utf-8",
-            "X-Automap-Run": uuid.uuid4().hex, "X-Automap-Seq": "0", "X-Automap-Last": "1",
-            "X-Automap-Sha256": hashlib.sha256(data).hexdigest(), "X-Automap-Sender": f"{NAME}/{VERSION}",
-            "X-Automap-Kind": "runs",
-        }, data)
+        status, body = push_kind("runs", payload)
         if status == 202:
             log(f"runs (beta) last {days} days: pushed {total} runs, {failed} with errors")
         else:
@@ -360,21 +382,11 @@ def push_usage(atlassian, dry_run):
         for start, end, month in u.periods(int(time.time() * 1000)):
             doc = {"usage": u.month(start, end, month), "sender": {"name": NAME, "version": VERSION}}
             payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
-            # one chunk: keep the busiest rules if a huge site does not fit
-            while len(payload) > 250000 and doc["usage"]["flows"]:
-                doc["usage"]["flows"] = sorted(doc["usage"]["flows"], key=lambda f: -f["steps"])[: len(doc["usage"]["flows"]) * 3 // 4]
-                payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=True)
             steps, rules = doc["usage"]["steps"]["total"], len(doc["usage"]["flows"])
             if dry_run:
                 log(f"usage (beta) {month}: {steps} steps, {rules} rules with usage; nothing pushed")
                 continue
-            data = payload.encode("ascii")
-            status, _, body = request("POST", env("AUTOMAP_URL"), {
-                "Authorization": f"Bearer {env('AUTOMAP_KEY')}", "Content-Type": "text/plain; charset=utf-8",
-                "X-Automap-Run": uuid.uuid4().hex, "X-Automap-Seq": "0", "X-Automap-Last": "1",
-                "X-Automap-Sha256": hashlib.sha256(data).hexdigest(), "X-Automap-Sender": f"{NAME}/{VERSION}",
-                "X-Automap-Kind": "usage",
-            }, data)
+            status, body = push_kind("usage", payload)
             if status == 202:
                 log(f"usage (beta) {month}: pushed {steps} steps for {rules} rules")
             else:

@@ -28,7 +28,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 const NAME = 'node';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const UA = `automap-sync-${NAME}/${VERSION}`;
 const EXIT = { config: 2, atlassian: 3, refused: 4, later: 5, failed: 6 };
 const REFUSED = new Set([400, 401, 402, 403, 404, 405, 413, 426]);
@@ -271,15 +271,29 @@ class Runs {
   }
 }
 
-/** One push of one chunk with its kind; usage and runs are each a push of their own. */
+/** Usage or runs (beta), in chunks like the rules; the receiver keeps them whole on the last one (APPS-499). */
 async function pushKind(kind, payload) {
   const data = Buffer.from(payload, 'ascii');
-  return request('POST', env('AUTOMAP_URL'), {
-    Authorization: `Bearer ${env('AUTOMAP_KEY')}`, 'Content-Type': 'text/plain; charset=utf-8',
-    'X-Automap-Run': randomUUID().replace(/-/g, ''), 'X-Automap-Seq': '0', 'X-Automap-Last': '1',
-    'X-Automap-Sha256': createHash('sha256').update(data).digest('hex'), 'X-Automap-Sender': `${NAME}/${VERSION}`,
-    'X-Automap-Kind': kind,
-  }, data);
+  const checksum = createHash('sha256').update(data).digest('hex');
+  const size = Number(env('AUTOMAP_CHUNK_BYTES', '200000'));
+  const chunks = [];
+  for (let i = 0; i < data.length; i += size) chunks.push(data.subarray(i, i + size));
+  const run = randomUUID().replace(/-/g, '');
+  let res = { status: null, text: '' };
+  for (let seq = 0; seq < chunks.length; seq += 1) {
+    const headers = {
+      Authorization: `Bearer ${env('AUTOMAP_KEY')}`, 'Content-Type': 'text/plain; charset=utf-8',
+      'X-Automap-Run': run, 'X-Automap-Seq': String(seq), 'X-Automap-Sender': `${NAME}/${VERSION}`, 'X-Automap-Kind': kind,
+    };
+    if (seq === chunks.length - 1) { headers['X-Automap-Last'] = '1'; headers['X-Automap-Sha256'] = checksum; }
+    for (let tries = 1; tries <= 3; tries += 1) {
+      res = await request('POST', env('AUTOMAP_URL'), headers, chunks[seq]);
+      if (res.status !== null && res.status < 500 && res.status !== 429) break;
+      if (tries < 3) await sleep(2 ** tries * 1000);
+    }
+    if (res.status !== 202) break;
+  }
+  return res;
 }
 
 /** Read and push the usage; a failure is logged and the run goes on. */
@@ -289,12 +303,7 @@ async function pushUsage(ctx, dryRun) {
     const u = new Usage(ctx);
     for (const [start, end, month] of Usage.periods(Date.now())) {
       const doc = { usage: await u.month(start, end, month), sender: { name: NAME, version: VERSION } };
-      let payload = asciiJson(doc);
-      // one chunk: keep the busiest rules if a huge site does not fit
-      while (payload.length > 250000 && doc.usage.flows.length) {
-        doc.usage.flows = doc.usage.flows.sort((a, b) => b.steps - a.steps).slice(0, Math.floor(doc.usage.flows.length * 3 / 4));
-        payload = asciiJson(doc);
-      }
+      const payload = asciiJson(doc);
       const steps = doc.usage.steps.total;
       const rules = doc.usage.flows.length;
       if (dryRun) { log(`usage (beta) ${month}: ${steps} steps, ${rules} rules with usage; nothing pushed`); continue; }
@@ -314,13 +323,8 @@ async function pushRuns(ctx, dryRun) {
     const days = Math.max(1, Math.min(30, Number(process.env.AUTOMAP_RUNS_DAYS) || 7));
     const runs = await new Runs(ctx).read(days, Date.now());
     const doc = { runs, sender: { name: NAME, version: VERSION } };
-    let payload = asciiJson(doc);
+    const payload = asciiJson(doc);
     const total = (rows) => rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0);
-    while (payload.length > 250000 && runs.rows.length) {
-      runs.rows = runs.rows.sort((a, b) => (b.success + b.errors + b.noop) - (a.success + a.errors + a.noop))
-        .slice(0, Math.floor(runs.rows.length * 3 / 4));
-      payload = asciiJson(doc);
-    }
     const all = total(runs.rows);
     const failed = runs.rows.reduce((n, x) => n + x.errors, 0);
     if (dryRun) { log(`runs (beta) last ${days} days: ${all} runs, ${failed} with errors; nothing pushed`); return; }

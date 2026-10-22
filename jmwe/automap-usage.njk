@@ -34,7 +34,7 @@
 
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.2.1" -%}
+{%- set VERSION = "1.3.0" -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
 {%- set failures = [] -%}
@@ -58,13 +58,38 @@
 {%- set INTERNAL = "https://api.atlassian.com/automation/internal-api/jira/" + tenant.cloudId + "/pro/rest/GLOBAL/" -%}
 {%- set nowMs = (now | date("x")) | int -%}
 {%- set dayNow = nowMs // 86400000 -%}
-{%- set LIMIT = 80000 -%}
+{%- set CHUNK_CHARS = 80000 -%}
+{#- usage or runs, in chunks of CHUNK_CHARS like the rules (at most 240 KB of UTF-8 each), never
+    split inside a surrogate pair, the whole proven by its length on the last one; answers
+    "" or the first refusal, "HTTP <code>" -#}
 {%- macro pushKind(kind, body) -%}
-{%- set res = PUSH_URL | callRest(verb="post", body=body, noJSON=true, dontFail=true, options={ "headers": {
-    "Authorization": "Bearer " + KEY, "Content-Type": "text/plain; charset=utf-8",
-    "X-Automap-Run": NAME + "-" + kind + "-" + body.length + "-" + nowMs, "X-Automap-Seq": "0", "X-Automap-Last": "1",
-    "X-Automap-Length": "" + body.length, "X-Automap-Sender": NAME + "/" + VERSION, "X-Automap-Kind": kind }, "timeout": 60000 }) -%}
-{{- ("HTTP " + res._statusCode) if res._statusCode else "" -}}
+{%- set bounds = [0] -%}
+{%- for bi in range(0, (body.length // CHUNK_CHARS) + 2) -%}
+  {%- set st = bounds[bounds.length - 1] -%}
+  {%- if st < body.length -%}
+    {%- set en = (st + CHUNK_CHARS) if (st + CHUNK_CHARS) < body.length else body.length -%}
+    {%- set cc = body.charCodeAt(en - 1) -%}
+    {%- set en = (en - 1) if (en < body.length and cc >= 55296 and cc <= 56319) else en -%}
+    {%- set _ = bounds.push(en) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set n = bounds.length - 1 -%}
+{%- set krun = NAME + "-" + kind + "-" + body.length + "-" + nowMs -%}
+{%- set bad = [] -%}
+{%- for ci in range(0, n) -%}
+  {%- if ci < n and not bad.length -%}
+    {%- set hdr = { "Authorization": "Bearer " + KEY, "Content-Type": "text/plain; charset=utf-8", "X-Automap-Run": krun,
+        "X-Automap-Seq": "" + ci, "X-Automap-Sender": NAME + "/" + VERSION, "X-Automap-Kind": kind } -%}
+    {%- if ci == n - 1 -%}
+      {%- set hdr = { "Authorization": "Bearer " + KEY, "Content-Type": "text/plain; charset=utf-8", "X-Automap-Run": krun,
+          "X-Automap-Seq": "" + ci, "X-Automap-Sender": NAME + "/" + VERSION, "X-Automap-Kind": kind,
+          "X-Automap-Last": "1", "X-Automap-Length": "" + body.length } -%}
+    {%- endif -%}
+    {%- set res = PUSH_URL | callRest(verb="post", body=body.slice(bounds[ci], bounds[ci + 1]), noJSON=true, dontFail=true, options={ "headers": hdr, "timeout": 60000 }) -%}
+    {%- if res._statusCode -%}{%- set _ = bad.push("HTTP " + res._statusCode) -%}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- bad[0] if bad.length else "" -}}
 {%- endmacro -%}
 
 {%- if USAGE and not shut -%}
@@ -151,18 +176,10 @@
               + ((',"limits":' + (lims | dump)) if lims.length else "")
               + ((',"trend":' + (trend | dump)) if (not tr._statusCode and tr.data) else "")
               + ((',"creditPack":' + ("true" if pack.hasCreditPack else "false")) if (not pack._statusCode and not pack._error) else "") -%}
-          {#- one chunk: keep the busiest rules if a huge site does not fit -#}
-          {%- set keep = [flows] -%}
-          {%- for t in range(0, 30) -%}
-            {%- set doc = '{"usage":' + head + ',"flows":' + (keep[0] | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
-            {%- if doc.length > LIMIT and keep[0].length -%}
-              {%- set _ = keep.splice(0, 1, (keep[0] | sort(true, false, "steps")).slice(0, ((keep[0].length * 3) // 4))) -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {%- set doc = '{"usage":' + head + ',"flows":' + (keep[0] | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
+          {%- set doc = '{"usage":' + head + ',"flows":' + (flows | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
           {%- set said = "" + (pushKind("usage", doc) | trim) -%}
           {%- if said.indexOf("HTTP 403") == 0 -%}{%- set _ = closed.push(1) -%}{%- endif -%}
-          {%- set _ = notes.push(("usage (beta) " + pd[2] + ": not taken, receiver answered " + said) if said else ("usage (beta) " + pd[2] + ": pushed " + (ca.total or 0) + " steps for " + keep[0].length + " rules")) -%}
+          {%- set _ = notes.push(("usage (beta) " + pd[2] + ": not taken, receiver answered " + said) if said else ("usage (beta) " + pd[2] + ": pushed " + (ca.total or 0) + " steps for " + flows.length + " rules")) -%}
         {%- endif -%}
       {%- endif -%}
     {%- endif -%}
@@ -257,11 +274,10 @@
         {%- endif -%}
       {%- endif -%}
     {%- endfor -%}
-    {#- rows as JSON, the busiest first, as many as fit in one chunk -#}
+    {#- rows as JSON, the busiest first -#}
     {%- set order = [] -%}
     {%- for i in range(0, keys.length) -%}{%- if i < keys.length -%}{%- set _ = order.push({ "i": i, "n": cSucc[i] + cErr[i] + cNoop[i] }) -%}{%- endif -%}{%- endfor -%}
     {%- set rowsJson = [] -%}
-    {%- set size = [0] -%}
     {%- set totals = [0, 0] -%}
     {%- for o in (order | sort(true, false, "n")) -%}
       {%- set i = o.i -%}
@@ -270,11 +286,8 @@
       {%- set one = '{"uuid":' + (meta[i].uuid | dump) + ',"day":"' + meta[i].day + '","name":' + (meta[i].name | dump)
           + ',"success":' + cSucc[i] + ',"errors":' + cErr[i] + ',"noop":' + cNoop[i] + ',"edits":' + cEdit[i]
           + ',"ms":' + cMs[i] + ',"maxMs":' + cMax[i] + (',"hours":{' + hp.join(",") + '}' if hp.length else "") + '}' -%}
-      {%- if size[0] + one.length < LIMIT - 4000 -%}
-        {%- set _ = rowsJson.push(one) -%}
-        {%- set _ = size.splice(0, 1, size[0] + one.length + 1) -%}
-        {%- set _ = totals.splice(0, 2, totals[0] + o.n, totals[1] + cErr[i]) -%}
-      {%- endif -%}
+      {%- set _ = rowsJson.push(one) -%}
+      {%- set _ = totals.splice(0, 2, totals[0] + o.n, totals[1] + cErr[i]) -%}
     {%- endfor -%}
     {%- set doc = '{"runs":{"window":' + ({ "start": startMs, "end": nowMs } | dump) + ',"rows":[' + rowsJson.join(",") + '],"errors":' + (errs | dump)
         + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}

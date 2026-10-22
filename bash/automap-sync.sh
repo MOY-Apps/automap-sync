@@ -26,7 +26,7 @@
 set -u
 
 NAME=bash
-VERSION=1.1.0
+VERSION=1.2.0
 UA="automap-sync-$NAME/$VERSION"
 
 log() { printf 'automap-sync %s %s: %s\n' "$NAME" "$VERSION" "$*" >&2; }
@@ -195,15 +195,33 @@ internal_get() {
   return 1
 }
 
-# send_kind <kind> <file> - one push of one chunk with its kind; the answer code in KIND_CODE
+# send_kind <kind> <file> - usage or runs (beta) in chunks like the rules, kept whole by the
+# receiver on the last one (APPS-499); the last answer's code in KIND_CODE
 send_kind() {
-  local sum
-  sum="$($SHA "$2" | cut -d' ' -f1)"
+  local kind="$1" file="$2" sum run dir part seq count tries
+  sum="$($SHA "$file" | cut -d' ' -f1)"
+  run="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  dir="$TMP/kind-$kind"
+  rm -rf "$dir"; mkdir "$dir"
+  (cd "$dir" && split -b "$CHUNK" -a 4 "$file" part.)
+  count="$(ls "$dir" | wc -l | tr -d ' ')"
   printf 'header = "Authorization: Bearer %s"\n' "$AUTOMAP_KEY" > "$TMP/automap.cfg"
-  KIND_CODE="$(curl -sS -A "$UA" -K "$TMP/automap.cfg" -X POST -H 'Content-Type: text/plain; charset=utf-8' \
-    -H "X-Automap-Run: $(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" -H 'X-Automap-Seq: 0' -H 'X-Automap-Last: 1' \
-    -H "X-Automap-Sha256: $sum" -H "X-Automap-Sender: $NAME/$VERSION" -H "X-Automap-Kind: $1" \
-    --data-binary "@$2" -o "$TMP/resp" -w '%{http_code}' "$AUTOMAP_URL" 2>/dev/null)" || KIND_CODE=000
+  seq=0
+  for part in $(ls "$dir"); do
+    set -- -H "X-Automap-Run: $run" -H "X-Automap-Seq: $seq" -H "X-Automap-Sender: $NAME/$VERSION" -H "X-Automap-Kind: $kind"
+    if [ "$seq" -eq $(( count - 1 )) ]; then set -- "$@" -H 'X-Automap-Last: 1' -H "X-Automap-Sha256: $sum"; fi
+    tries=1
+    while :; do
+      KIND_CODE="$(curl -sS -A "$UA" -K "$TMP/automap.cfg" -X POST -H 'Content-Type: text/plain; charset=utf-8' \
+        "$@" --data-binary "@$dir/$part" -o "$TMP/resp" -w '%{http_code}' "$AUTOMAP_URL" 2>/dev/null)" || KIND_CODE=000
+      if [ "$KIND_CODE" != 000 ] && [ "$KIND_CODE" -lt 500 ] && [ "$KIND_CODE" != 429 ]; then break; fi
+      [ "$tries" -ge 3 ] && break
+      sleep $(( 1 << tries ))
+      tries=$(( tries + 1 ))
+    done
+    [ "$KIND_CODE" = 202 ] || return
+    seq=$(( seq + 1 ))
+  done
 }
 
 # usage_month <start> <end> <month> - one period's usage into $TMP/usage.json; account ids are not copied
@@ -248,13 +266,6 @@ usage_month() {
   ' > "$TMP/usage.json" || { ERR="could not read the usage"; return 1; }
 }
 
-# fit <file> <array path> <sort key jq> - one chunk: keep the busiest entries until it fits
-fit() {
-  while [ "$(wc -c < "$1" | tr -d ' ')" -gt 250000 ] && [ "$(jq "$2 | length" "$1")" -gt 0 ]; do
-    jq -a -c -j "$2 |= (sort_by(- ($3)) | .[0:((length * 3 / 4) | floor)])" "$1" > "$1.tmp" && mv "$1.tmp" "$1"
-  done
-}
-
 # push_usage - read and push the usage; a failure is logged and the run goes on
 push_usage() {
   off AUTOMAP_USAGE && return
@@ -272,7 +283,6 @@ push_usage() {
   while read -r start end month; do
     if ! usage_month "$start" "$end" "$month"; then log "usage (beta) skipped: $ERR"; return; fi
     jq -a -c -j --arg n "$NAME" --arg v "$VERSION" '{usage: ., sender: {name: $n, version: $v}}' "$TMP/usage.json" > "$TMP/usage.payload"
-    fit "$TMP/usage.payload" '.usage.flows' '.steps'
     steps="$(jq '.usage.steps.total' "$TMP/usage.payload")"
     n="$(jq '.usage.flows | length' "$TMP/usage.payload")"
     if [ -n "$DRY_RUN" ]; then log "usage (beta) $month: $steps steps, $n rules with usage; nothing pushed"; continue; fi
@@ -342,7 +352,6 @@ push_runs() {
     --slurpfile fold "$TMP/r-fold.json" --slurpfile errors "$TMP/r-errors.ndjson" \
     '{runs: {window: {start: $start, end: $end}, rows: $fold[0].rows, errors: $errors}, sender: {name: $n, version: $v}}' \
     > "$TMP/runs.payload" || { log "runs (beta) skipped: could not assemble the runs"; return; }
-  fit "$TMP/runs.payload" '.runs.rows' '.success + .errors + .noop'
   total="$(jq '[.runs.rows[] | .success + .errors + .noop] | add // 0' "$TMP/runs.payload")"
   bad="$(jq '[.runs.rows[] | .errors] | add // 0' "$TMP/runs.payload")"
   if [ -n "$DRY_RUN" ]; then log "runs (beta) last $days days: $total runs, $bad with errors; nothing pushed"; return; fi

@@ -30,7 +30,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.2.1'
+final String VERSION = '1.3.0'
 final long STARTED = System.currentTimeMillis()
 // ScriptRunner Cloud stops a script after a few minutes; the runs (beta) are read only
 // while there is time left, and skipped rather than sent in part when there is not
@@ -110,19 +110,34 @@ def asciiJson = { Object doc ->
   b.toString()
 }
 
-// one push of one chunk with its kind; usage and runs are each a push of their own
+// usage or runs (beta), in chunks like the rules; the receiver keeps them whole on the last one
 def pushKind = { String kind, String text ->
   byte[] bytes = text.getBytes('US-ASCII')
-  Unirest.post(cfg('AUTOMAP_URL')).headers([
-    'Authorization'   : "Bearer ${cfg('AUTOMAP_KEY')}".toString(),
-    'Content-Type'    : 'text/plain; charset=utf-8',
-    'X-Automap-Run'   : UUID.randomUUID().toString().replace('-', ''),
-    'X-Automap-Seq'   : '0',
-    'X-Automap-Last'  : '1',
-    'X-Automap-Sha256': MessageDigest.getInstance('SHA-256').digest(bytes).encodeHex().toString(),
-    'X-Automap-Sender': "${NAME}/${VERSION}".toString(),
-    'X-Automap-Kind'  : kind,
-  ]).body(bytes).asString()
+  String whole = MessageDigest.getInstance('SHA-256').digest(bytes).encodeHex().toString()
+  int size = cfg('AUTOMAP_CHUNK_BYTES', '200000').toInteger()
+  List<byte[]> parts = []
+  for (int i = 0; i < bytes.length; i += size) parts << Arrays.copyOfRange(bytes, i, Math.min(i + size, bytes.length))
+  String run = UUID.randomUUID().toString().replace('-', '')
+  def r = null
+  for (int seq = 0; seq < parts.size(); seq++) {
+    Map<String, String> h = [
+      'Authorization'   : "Bearer ${cfg('AUTOMAP_KEY')}".toString(),
+      'Content-Type'    : 'text/plain; charset=utf-8',
+      'X-Automap-Run'   : run,
+      'X-Automap-Seq'   : seq.toString(),
+      'X-Automap-Sender': "${NAME}/${VERSION}".toString(),
+      'X-Automap-Kind'  : kind,
+    ]
+    if (seq == parts.size() - 1) { h['X-Automap-Last'] = '1'; h['X-Automap-Sha256'] = whole }
+    for (int tries = 1; tries <= 3; tries++) {
+      try { r = Unirest.post(cfg('AUTOMAP_URL')).headers(h).body(parts[seq]).asString() } catch (Exception e) { r = null }
+      int st = r ? r.status : 0
+      if (st != 0 && st < 500 && st != 429) break
+      if (tries < 3) Thread.sleep(1000L << tries)
+    }
+    if (!r || r.status != 202) break
+  }
+  r ?: [status: 0, body: '']
 }
 
 def n0 = { v -> v == null ? 0 : v }
@@ -182,11 +197,6 @@ def pushUsage = { ->
       try { u.creditPack = internalCall('hasCreditPack').hasCreditPack == true } catch (Exception ignore) { }
       Map doc = [usage: u, sender: [name: NAME, version: VERSION]]
       String text = asciiJson(doc)
-      // one chunk: keep the busiest rules if a huge site does not fit
-      while (text.length() > 250000 && u.flows) {
-        u.flows = u.flows.sort { -it.steps }.take((int) (u.flows.size() * 3 / 4))
-        text = asciiJson(doc)
-      }
       if (dryRun) { say("usage (beta) ${month}: ${u.steps.total} steps, ${u.flows.size()} rules with usage; nothing pushed"); return }
       def r = pushKind('usage', text)
       if (r.status == 403) shut[0] = true
@@ -271,10 +281,6 @@ def pushRuns = { ->
     Map runs = [window: [start: start, end: nowMs], rows: rows.values() as List, errors: errors]
     Map doc = [runs: runs, sender: [name: NAME, version: VERSION]]
     String text = asciiJson(doc)
-    while (text.length() > 250000 && runs.rows) {
-      runs.rows = runs.rows.sort { -(it.success + it.errors + it.noop) }.take((int) (runs.rows.size() * 3 / 4))
-      text = asciiJson(doc)
-    }
     int total = runs.rows.sum(0) { it.success + it.errors + it.noop }
     int bad = runs.rows.sum(0) { it.errors }
     String span = days == 1 ? 'yesterday and today' : "last ${days} days"

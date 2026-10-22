@@ -45,6 +45,9 @@ separate push:
   folded on your side into per-rule, per-day counts, plus the failing component and the
   error's code for the rules that failed. No issue ids, no message text, no account ids.
 
+From 1.2.0 (ScriptRunner and JMWE 1.3.0) both go in chunks like the rules, so a large site
+sends every rule, not only the busiest.
+
 Both read an internal Atlassian API that is not documented and can change. If either
 fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=off` and
 `AUTOMAP_RUNS=off` switch them off; in JMWE they are the template values `USAGE` and
@@ -85,9 +88,9 @@ gets exit 5.
 ## Updates
 
 - The image tag `:1` always points at the newest compatible release; `--pull always` (or
-  `imagePullPolicy: Always`) picks it up on the next run. Pin `:1.1.0` or a digest if you
+  `imagePullPolicy: Always`) picks it up on the next run. Pin `:1.3.0` or a digest if you
   update through Renovate/Dependabot instead.
-- Every sender sends its version (`X-Automap-Sender: python/1.1.0`). The settings card
+- Every sender sends its version (`X-Automap-Sender: python/1.2.0`). The settings card
   says when a newer one is out. If a version is ever too old for the protocol, the
   receiver answers `426 upgrade` and the sender exits 4 with a message saying so — a
   scheduled job stops loudly instead of loading something wrong.
