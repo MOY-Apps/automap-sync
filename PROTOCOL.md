@@ -302,6 +302,18 @@ keeps 35 days back (`src/usage/runs.js`). The card shows a rule's runs over the 
 and the failing component in words; the Data tab lists the rules that fail most and the
 ones that mostly do nothing.
 
+## 6c. Old senders keep working
+
+A job is pasted once and runs for years, so every sender version ever released keeps
+working against every later receiver. The minimum in `src/push/senders.js` stays `1.0.0`
+for every sender. The receiver keeps taking every shape a released sender has sent: rules in
+one chunk or many, proven by SHA-256 or by length; usage and runs in one chunk (1.1) or in
+many (1.2+). A new feature may ask for a newer sender to *use* it; it never stops an older
+one from doing what it did. Raising a minimum (the `426 upgrade` answer) or dropping a shape
+is the owner's decision, made explicitly. The test "compatibility: …" in
+`test/push-sync.test.mjs` lists every released version and fails if either happens; add a
+version there when it ships.
+
 ## 7. Reference senders
 
 Six, in [`senders/`](.) — Python (the one in the Docker image), Node, bash,
