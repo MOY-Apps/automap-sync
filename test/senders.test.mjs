@@ -48,11 +48,13 @@ const SENDERS = [
   {
     name: 'scriptrunner',
     local: has('groovy'),
-    run: (e, envv, local) => (local
-      ? ['groovy', [join(root, 'scriptrunner/test/run-locally.groovy'), join(root, 'scriptrunner/AutomapSync.groovy')]]
+    run: (e, envv, local, file = 'AutomapSync.groovy') => (local
+      ? ['groovy', [join(root, 'scriptrunner/test/run-locally.groovy'), join(root, 'scriptrunner', file)]]
       : ['docker', ['run', '--rm', '-v', `${root}:/s:ro`, ...dockerEnv(envv), ...PLATFORM,
-        'groovy:4.0-jdk17', 'groovy', '/s/scriptrunner/test/run-locally.groovy', '/s/scriptrunner/AutomapSync.groovy']]),
+        'groovy:4.0-jdk17', 'groovy', '/s/scriptrunner/test/run-locally.groovy', `/s/scriptrunner/${file}`]]),
     dryRunByEnv: true,
+    // two Scheduled Jobs: the rules, and the usage and runs (beta), each with the whole time limit
+    usageFile: 'AutomapUsage.groovy',
   },
 ];
 
@@ -60,10 +62,10 @@ function dockerEnv(envv) {
   return Object.entries(envv).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
 }
 
-function runSender(s, site, extraEnv = {}, args = []) {
+function runSender(s, site, extraEnv = {}, args = [], file) {
   const envv = { ...site.env, AUTOMAP_CHUNK_BYTES: '900', ...extraEnv };
   if (s.dryRunByEnv && args.includes('--dry-run')) envv.AUTOMAP_DRY_RUN = '1';
-  const [cmd, argv] = s.run(args, envv, s.local);
+  const [cmd, argv] = s.run(args, envv, s.local, file);
   return new Promise((resolve) => {
     const child = spawn(cmd, argv, { env: { ...process.env, ...envv } });
     let out = '';
@@ -92,6 +94,7 @@ for (const s of SENDERS) {
       assert.ok(site.state.answers.filter((a) => a === 'accepted').length >= 2, 'small chunks mean several requests');
       assert.ok(!out.includes(KEY) && !out.includes('atlassian-token-for-tests'), 'no secret in the log');
       assert.ok(!out.includes('Закрыть'), 'no rule content in the log');
+      if (s.usageFile) assert.equal(site.state.usageCalls, 0, 'the rules script leaves usage and runs to the other one');
     } finally {
       await site.close();
     }
@@ -117,13 +120,19 @@ for (const s of SENDERS) {
 for (const s of SENDERS) {
   const available = s.ok || s.local || dockerUp;
   const host = !s.ok && !s.local ? 'host.docker.internal' : '127.0.0.1';
-  test(`${s.name}: usage and runs (beta) are pushed apart from the rules, without ids, and never fail the run`, { skip: available ? false : `${s.name}: runtime not available`, timeout: 240_000 }, async () => {
-  const py = s;
+  test(`${s.name}: usage and runs (beta) are pushed apart from the rules, without ids, and never fail the run`, { skip: available ? false : `${s.name}: runtime not available`, timeout: 360_000 }, async () => {
+  // a sender split in two (ScriptRunner) runs its usage script after the rules one, as two jobs would
+  const runBoth = async (site2, extra = {}) => {
+    const first = await runSender(s, site2, extra);
+    if (!s.usageFile) return first;
+    const second = await runSender(s, site2, extra, [], s.usageFile);
+    return { code: first.code || second.code, out: first.out + second.out };
+  };
   const rules = makeRules(3);
   const site = await startFakeSite({ rules, host, flaky: false });
   const broken = await startFakeSite({ rules, host, flaky: false, usage: 'broken' });
   try {
-    const { code, out } = await runSender(py, site);
+    const { code, out } = await runBoth(site);
     assert.equal(code, 0, out);
     assert.equal(site.state.loaded.length, 1, 'the rules, once');
     assert.equal(site.state.pushed.usage.length >= 1, true, out);
@@ -153,7 +162,7 @@ for (const s of SENDERS) {
     assert.match(out, /runs \(beta\) last 7 days: pushed 3 runs, 1 with errors/);
 
     // the internal API gone: the rules still go, the run still succeeds
-    const gone = await runSender(py, broken);
+    const gone = await runBoth(broken);
     assert.equal(gone.code, 0, gone.out);
     assert.equal(broken.state.loaded.length, 1);
     assert.equal(broken.state.pushed.usage.length, 0);
@@ -162,7 +171,7 @@ for (const s of SENDERS) {
 
     // switched off: not even read
     const before = site.state.pushed.usageCalls;
-    assert.equal((await runSender(py, site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
+    assert.equal((await runBoth(site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
     assert.equal(site.state.pushed.usageCalls, before);
   } finally {
     await site.close();
@@ -190,9 +199,14 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
   const site = await startFakeSite({ rules, flaky: false });
   const broken = await startFakeSite({ rules, flaky: false, usage: 'broken' });
   try {
-    const { code, out } = await runJmwe(site);
+    // two Scheduled actions: the rules template alone reads no usage and no audit log
+    const rulesOnly = await runJmwe(site);
+    assert.equal(rulesOnly.code, 0, rulesOnly.out);
+    assert.equal(site.state.loaded.length, 1, rulesOnly.out);
+    assert.equal(site.state.usageCalls, 0, 'the rules template leaves usage and runs to the other one');
+    const { code, out } = await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk' });
     assert.equal(code, 0, out);
-    assert.equal(site.state.loaded.length, 1, out);
+    assert.equal(site.state.loaded.length, 1, 'the usage template pushes no rules');
     const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
     assert.equal(u.steps.total, 1310);
     assert.deepEqual(u.flows.map((f) => [f.uuid, f.runs, f.steps]), [[rules[0].uuid, 14, 1303], [rules[1].uuid, 5, 7]]);
@@ -218,15 +232,16 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     assert.ok(r.rows.every((x) => x.day === today || x.day === yesterday), JSON.stringify(r.rows.map((x) => x.day)));
 
-    const gone = await runJmwe(broken);
+    assert.equal((await runJmwe(broken)).code, 0);
+    assert.equal(broken.state.loaded.length, 1, 'the rules go whatever the internal API does');
+    const gone = await runJmwe(broken, { JMWE_TEMPLATE: 'automap-usage.njk' });
     assert.equal(gone.code, 0, gone.out);
-    assert.equal(broken.state.loaded.length, 1);
     assert.equal(broken.state.pushed.usage.length, 0);
     assert.match(gone.out, /usage \(beta\) skipped/);
     assert.match(gone.out, /runs \(beta\) skipped/);
 
     const before = site.state.usageCalls;
-    assert.equal((await runJmwe(site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
+    assert.equal((await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk', AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
     assert.equal(site.state.usageCalls, before);
   } finally {
     await site.close();

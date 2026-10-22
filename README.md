@@ -15,8 +15,8 @@ The token never leaves your infrastructure; the app only ever sees a key it issu
 | [`node/automap-sync.mjs`](node/automap-sync.mjs) | anywhere | Node 18+, nothing else | your tooling is JavaScript |
 | [`bash/automap-sync.sh`](bash/automap-sync.sh) | Linux, macOS | bash 3.2+, curl, jq 1.6+ | a minimal box with no Python |
 | [`powershell/automap-sync.ps1`](powershell/automap-sync.ps1) | Windows, Linux, macOS | PowerShell 7.2+ | a Windows estate, Task Scheduler |
-| [`scriptrunner/AutomapSync.groovy`](scriptrunner/AutomapSync.groovy) | inside Jira | ScriptRunner for Jira Cloud | you already have ScriptRunner and a small site (see its limits) |
-| [`jmwe/automap-sync.njk`](jmwe/automap-sync.njk) | inside Jira | JMWE for Jira Cloud (a Nunjucks template in a Scheduled action) | you already have JMWE and a small site; the token sits in the template, the payload is proven by length |
+| [`scriptrunner/AutomapSync.groovy`](scriptrunner/AutomapSync.groovy) + [`AutomapUsage.groovy`](scriptrunner/AutomapUsage.groovy) | inside Jira | ScriptRunner for Jira Cloud, two Scheduled Jobs: the rules, and the usage and runs | you already have ScriptRunner and a small site (see its limits) |
+| [`jmwe/automap-sync.njk`](jmwe/automap-sync.njk) + [`automap-usage.njk`](jmwe/automap-usage.njk) | inside Jira | JMWE for Jira Cloud (Nunjucks templates in two Scheduled actions: the rules, and the usage and runs) | you already have JMWE and a small site; the token sits in the template, the payload is proven by length |
 
 All of them read the same settings, send the same thing and exit the same way.
 
@@ -48,7 +48,8 @@ separate push:
 Both read an internal Atlassian API that is not documented and can change. If either
 fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=off` and
 `AUTOMAP_RUNS=off` switch them off; in JMWE they are the template values `USAGE` and
-`RUNS`. ScriptRunner reads the audit log only while its run has time left, and JMWE reads
+`RUNS`. Inside Jira they are a job of their own (`AutomapUsage.groovy`, `automap-usage.njk`),
+so the rules job keeps the host's whole time limit. ScriptRunner reads the audit log only while its run has time left, and JMWE reads
 at most `RUNS_MAX_PAGES` pages of it: past that the runs are skipped, not sent in part, and
 `AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix.
 
@@ -77,7 +78,8 @@ gets exit 5.
 - **Kubernetes** — [`ci/kubernetes-cronjob.yml`](ci/kubernetes-cronjob.yml)
 - **cron** — `17 3 * * * docker run --rm --pull always --env-file /etc/automap-sync.env ghcr.io/moy-apps/automap-sync:1`
 - **Windows** — Task Scheduler: `pwsh -NoProfile -File C:\automap\automap-sync.ps1`, with the variables set for the task's account
-- **ScriptRunner** — Scheduled Jobs, daily, the script pasted in, the variables in Script Variables
+- **ScriptRunner** — two Scheduled Jobs, daily: `AutomapSync.groovy` (the rules) and `AutomapUsage.groovy` (usage and runs, may run every few hours), the variables in Script Variables, shared
+- **JMWE** — two Scheduled actions on one anchor work item: `automap-sync.njk` and `automap-usage.njk`, both filled with the same values
 
 ## Updates
 

@@ -260,7 +260,10 @@ From the same sender version, a run also reads the **audit log** of the last
 side and pushes it as a **third push**, `X-Automap-Kind: runs`, one chunk, with the same
 rules as usage: never fails the run, spends no load, `AUTOMAP_RUNS=off` switches it off.
 
-Inside Jira the two app-hosted senders work within their host's limits. **ScriptRunner**
+Inside Jira the two app-hosted senders come in two parts, each a job of its own with the
+host's whole time limit: the rules (`AutomapSync.groovy`, `automap-sync.njk`) and the usage
+and runs (`AutomapUsage.groovy`, `automap-usage.njk`, from 1.2.0), so a slow audit log never
+holds up the rules. They work within their host's limits. **ScriptRunner**
 reads the audit log only while the job has time left (200 s of the run) and skips the runs,
 rather than sending some days of them, when it does not fit — `AUTOMAP_RUNS_DAYS` lower is
 the answer. **JMWE** takes its switches as template values (`USAGE`, `RUNS`, `RUNS_DAYS`),

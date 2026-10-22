@@ -79,7 +79,8 @@ export function render(templateText) {
 }
 
 export function filled() {
-  let t = readFileSync(join(here, '..', 'automap-sync.njk'), 'utf8');
+  // the rules template by default; JMWE_TEMPLATE=automap-usage.njk for the usage and runs one
+  let t = readFileSync(join(here, '..', process.env.JMWE_TEMPLATE || 'automap-sync.njk'), 'utf8');
   const values = {
     '"your-site.atlassian.net"': JSON.stringify(siteHost),
     '"you@example.com"': JSON.stringify(env('ATLASSIAN_EMAIL')),
