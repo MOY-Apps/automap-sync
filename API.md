@@ -359,7 +359,7 @@ Every answer is JSON from a fixed list. `error` names it; `detail` is a fixed se
 | 422 | `checksum` | the joined chunks do not match the SHA-256 or the length; nothing kept, the previous map stays. A part: only that part is dropped, the group stays | new run (a part: the same part again from chunk 0); if it repeats, check line breaks, the hash input and compression |
 | 426 | `upgrade` | `X-Automap-Sender` names one of our senders below its minimum | update the sender |
 | 429 | `allowance` | rules only: the plan's loads are used up | stop; try after the window moves |
-| 429 | `rate-limited` | over 300 requests in the current 10-minute window | wait ten minutes, then a new run |
+| 429 | `rate-limited` | over 500 requests in the current 10-minute window | wait ten minutes, then a new run |
 | 500 | `failed` | the receiver could not store the chunk | same chunk again with backoff, then a new run later |
 
 A `409` on a resent last chunk of rules can mean the first copy arrived and the run is
@@ -377,7 +377,7 @@ last chunk, the proof (`422`).
 |---|---|
 | One chunk | 262,144 bytes of UTF-8 (`413` above). Send 200,000 |
 | Chunks in one push | 400 (`X-Automap-Seq` 0 to 399) |
-| Requests | 300 per key in a fixed 10-minute window, every request with the right key counted, refused ones too (`429 rate-limited`) |
+| Requests | 500 per key in a fixed 10-minute window, every request with the right key counted, refused ones too (`429 rate-limited`) |
 | Rules pushes that build | Advanced: 5 in a rolling day, files and pushes alike (`429 allowance`) |
 | Usage rules | up to 10,000 a month (what Atlassian lists); Advanced keeps all |
 | Runs | window of at most 31 days; 100,000 rows (20,000 a day) and 500 errors per push; 35 days kept |

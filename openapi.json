@@ -30,7 +30,7 @@
     "maxChunkBytes": 262144,
     "recommendedChunkBytes": 200000,
     "maxChunks": 400,
-    "rateLimit": 300,
+    "rateLimit": 500,
     "rateWindowSeconds": 600,
     "maxFlows": 10000,
     "runsMaxRows": 100000,
@@ -251,7 +251,7 @@
             }
           },
           "429": {
-            "description": "Try later; the `error` word says which. `allowance` (rules only, on chunk 0 of a new run): the plan's loads are used up (Advanced: 5 in a rolling day, files and pushes alike); the settings page says when the next is possible. Stop this run and schedule the sender within the allowance; usage and runs are still taken. `rate-limited`: over 300 requests for this key in the current 10-minute window; wait ten minutes, then start a new run.",
+            "description": "Try later; the `error` word says which. `allowance` (rules only, on chunk 0 of a new run): the plan's loads are used up (Advanced: 5 in a rolling day, files and pushes alike); the settings page says when the next is possible. Stop this run and schedule the sender within the allowance; usage and runs are still taken. `rate-limited`: over 500 requests for this key in the current 10-minute window; wait ten minutes, then start a new run.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
