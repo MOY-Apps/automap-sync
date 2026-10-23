@@ -1,13 +1,20 @@
 # .gitlab-ci.yml (or an included file) - push this site's automation rules to Automation
 # Map from a pipeline schedule (CI/CD -> Schedules, daily). CI/CD variables, masked and
 # protected: ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, AUTOMAP_KEY; plain: ATLASSIAN_SITE, AUTOMAP_URL.
+#
+# The sender image is distroless: no shell, so GitLab cannot run a `script:` inside it.
+# The job runs on a Docker-capable image and starts the sender with `docker run`, as the
+# GitHub example does. Docker-in-Docker needs a runner that allows it (privileged, or a
+# Docker socket); on a runner without, use the Python sender directly: `image: python:3.12`
+# and `script: [python3 -I automap_sync.py]` with the file in the repository.
 automap-sync:
-  image:
-    name: ghcr.io/moy-apps/automap-sync:1
-    entrypoint: ['']
-    pull_policy: always
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: '/certs'
   script:
-    - python3 -I /app/automap_sync.py
+    - docker run --rm --pull always -e ATLASSIAN_SITE -e ATLASSIAN_EMAIL -e ATLASSIAN_API_TOKEN -e AUTOMAP_URL -e AUTOMAP_KEY ghcr.io/moy-apps/automap-sync:1
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"

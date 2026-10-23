@@ -48,10 +48,15 @@
  * the first and PART = 2/2 on the second. Each pushes its half; the map is built when
  * the last half of the day has arrived. Three jobs are 1/3, 2/3, 3/3, up to 20. The
  * limit is honest: each copy must finish within ScriptRunner's time limit; raise M until
- * it does. The slices are cut by rule id, so a rule made between the two jobs may be
- * missed until the next day. The copies find each other by the UTC date they start on,
- * so schedule them inside the same UTC day - e.g. 01:00 and 02:00 UTC - never either
- * side of 00:00 UTC.
+ * it does. Each rule's part is a function of its own id (its uuid's first 8 hex digits
+ * modulo M), so a rule made or deleted between the jobs moves no other rule across the
+ * cut; the slices are therefore roughly, not exactly, equal. A rule made between the two
+ * jobs may be missed until the next day. The copies find each other by the UTC date they
+ * start on, so schedule them inside the same UTC day - e.g. 01:00 and 02:00 UTC - never
+ * either side of 00:00 UTC.
+ *
+ * From 1.5.0: a 409 to a last chunk sent again (its first answer lost) means the receiver
+ * took the first copy - the push is done, no second run.
  *
  * Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
  */
@@ -60,7 +65,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.4.0'
+final String VERSION = '1.5.0'
 final Set<Integer> REFUSED = [400, 401, 402, 403, 404, 405, 413, 426] as Set
 
 
@@ -114,11 +119,19 @@ if (!cloud) {
   String where = site ? ((site.contains('://') ? site : "https://${site}").replaceAll('/$', '') + '/_edge/tenant_info') : '/_edge/tenant_info'
   def r = Unirest.get(where).asString()
   if (r.status != 200) throw new IllegalStateException("[3] could not read the cloud id of ${site ?: 'this site'} (HTTP ${r.status})")
-  cloud = new JsonSlurper().parseText(r.body).cloudId
+  try { cloud = new JsonSlurper().parseText(r.body).cloudId } catch (Exception e) { throw new IllegalStateException('[3] the Automation API answered 200 with a body that is not JSON for the cloud id') }
 }
 String base = "${api}/automation/public/jira/${cloud}/rest/v1"
 
-def getText = { String path ->
+// sleep Retry-After seconds when given, else `wait` with jitter; answers the next wait (doubling to 15 s)
+def pause = { def r, long wait ->
+  String after = r ? r.headers.getFirst('Retry-After') : ''
+  Thread.sleep(after?.isInteger() ? after.toInteger() * 1000L : wait + (long) (Math.random() * 500))
+  Math.min(wait * 2, 15000L)
+}
+
+// the JSON of a 200; `what` names the read in the log ("the rule list", "rule 3 of 40"), never the rule's id
+def getJson = { String path, String what ->
   long wait = 1000
   for (int attempt = 1; attempt <= 5; attempt++) {
     def r
@@ -128,18 +141,19 @@ def getText = { String path ->
       r = null
     }
     int status = r ? r.status : 0
-    if (status == 200) return r.body
+    if (status == 200) {
+      // a proxy's HTML page is an Atlassian-side failure, not a crash
+      try { return new JsonSlurper().parseText(r.body) } catch (Exception e) { throw new IllegalStateException("[3] the Automation API answered 200 with a body that is not JSON for ${what}") }
+    }
     if (status == 401) throw new IllegalStateException('[3] the Automation API rejected the token (401): it must be an API token with the Automation scope, for this e-mail')
     if (status == 403) throw new IllegalStateException('[3] the Automation API refused access (403): the account must be a Jira administrator')
     if ((status == 0 || status == 429 || status >= 500) && attempt < 5) {
-      String after = r ? r.headers.getFirst('Retry-After') : ''
-      Thread.sleep(after?.isInteger() ? after.toInteger() * 1000L : wait + (long) (Math.random() * 500))
-      wait = Math.min(wait * 2, 15000L)
+      wait = pause(r, wait)
       continue
     }
-    throw new IllegalStateException("[3] the Automation API answered ${status} for ${path.tokenize('?')[0]}")
+    throw new IllegalStateException("[3] the Automation API answered ${status} for ${what}")
   }
-  throw new IllegalStateException('[3] gave up on the Automation API')
+  throw new IllegalStateException("[3] gave up on the Automation API reading ${what}")
 }
 
 // the list, page by page
@@ -149,7 +163,7 @@ String cursor = null
 int pages = 0
 while (true) {
   String q = 'limit=100' + (cursor ? '&cursor=' + URLEncoder.encode(cursor, 'UTF-8') : '')
-  def page = new JsonSlurper().parseText(getText("/rule/summary?${q}"))
+  def page = getJson("/rule/summary?${q}", 'the rule list')
   pages++
   (page.data ?: []).each { item ->
     String id = (item.id ?: item.uuid)?.toString()
@@ -162,20 +176,22 @@ while (true) {
 }
 say("${ids.size()} rules listed in ${pages} page(s)")
 
-// the slice: the ids in string order, cut into M equal pieces, so every copy of the job
-// cuts the list the same way whatever order the API listed it in
+// the slice: a rule's part is a function of its own id - its first 8 hex digits as a
+// number, modulo M, plus 1 - so a rule made or deleted between the jobs moves no other
+// rule across the cut, whatever order the API listed them in
 int total = ids.size()
 if (partM) {
-  ids = ids.sort(false)
-  int per = (int) Math.ceil(total / (double) partM)
-  ids = ids.subList(Math.min((partN - 1) * per, total), Math.min(partN * per, total))
+  ids = ids.sort(false).findAll { String id ->
+    String hex = id.toLowerCase().replaceAll('[^0-9a-f]', '').take(8)
+    (hex ? Long.parseLong(hex, 16) : 0L) % partM + 1 == partN
+  }
   say("part ${part}: ${ids.size()} of ${total} rules are this job's")
 }
 
 // each rule, wrapped in "rule"
 List<String> parts = []
-ids.each { id ->
-  def detail = new JsonSlurper().parseText(getText('/rule/' + URLEncoder.encode(id, 'UTF-8').replace('+', '%20')))
+ids.eachWithIndex { id, i ->
+  def detail = getJson('/rule/' + URLEncoder.encode(id, 'UTF-8').replace('+', '%20'), "rule ${i + 1} of ${ids.size()}")
   def rule = (detail instanceof Map && detail.containsKey('rule')) ? detail.rule : detail
   parts << '{"rule":' + JsonOutput.toJson(rule) + '}'
 }
@@ -224,7 +240,8 @@ def pushRules = { ->
       }
       def r = null
       int status = 0
-      for (int tries = 1; tries <= 3; tries++) {
+      int tries = 1
+      for (; tries <= 3; tries++) {
         try {
           r = Unirest.post(url).headers(h).body(chunks[seq]).asString()
           status = r.status
@@ -239,6 +256,16 @@ def pushRules = { ->
         continue
       }
       String w = word(r?.body)
+      // the first copy of the last chunk was taken; its answer was lost on the way back.
+      // A new run would load the same rules twice; a part sent again would change nothing.
+      if (status == 409 && tries > 1 && seq == chunks.size() - 1) {
+        if (part) {
+          say("part ${part}: ${parts.size()} rules already taken (the answer to the last chunk was lost)")
+          return [0, "part ${part}: pushed ${chunks.size()} chunk(s)"]
+        }
+        say("the last chunk was already taken: pushed ${data.length} bytes in ${chunks.size()} chunk(s); the map is rebuilding")
+        return [0, "pushed ${chunks.size()} chunk(s)"]
+      }
       // a part's run is the day's: a 409 means the map was built today already, or the
       // other job was set up with another M, and sending again would not change that
       if (status == 409 && part) return [4, "receiver answered 409 ${w}: today's map is already built, or another copy of this job has a different M in PART"]

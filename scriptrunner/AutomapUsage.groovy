@@ -23,6 +23,10 @@
  * Limits: the audit log is read only while the run has time left (200 s); if it does not
  * fit, the runs are skipped, not sent in part - set AUTOMAP_RUNS_DAYS lower.
  *
+ * From 1.5.0: the internal API is retried like the Automation API, honouring Retry-After;
+ * the audit log is read up to the instant the window ends (toTime); a 409 to a last chunk
+ * sent again (its first answer lost) means the receiver took the first copy.
+ *
  * Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
  */
 import groovy.json.JsonOutput
@@ -30,7 +34,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.3.0'
+final String VERSION = '1.5.0'
 final long STARTED = System.currentTimeMillis()
 // ScriptRunner Cloud stops a script after a few minutes; the runs (beta) are read only
 // while there is time left, and skipped rather than sent in part when there is not
@@ -79,12 +83,16 @@ boolean off = { String k -> (lookup(k)?.toString()?.toLowerCase() ?: '') in ['of
 boolean runsOff = (lookup('AUTOMAP_RUNS')?.toString()?.toLowerCase() ?: '') in ['off', '0', 'false', 'no']
 String internal = "${api}/automation/internal-api/jira/${cloud}/pro/rest/GLOBAL/"
 
-// the internal API behind Jira's Usage and Audit log tabs (BETA, undocumented)
-def internalCall = { String path, Object body = null, int tries = 1 ->
+// the internal API behind Jira's Usage and Audit log tabs (BETA, undocumented): a 429
+// (Retry-After honoured), a 5xx or no answer is tried three times with the Automation API's
+// backoff; anything else throws, which the callers turn into "skipped"
+def internalCall = { String path, Object body = null ->
   int status = 0
-  for (int attempt = 1; attempt <= tries; attempt++) {
+  long wait = 1000
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    def r = null
     try {
-      def r = body == null
+      r = body == null
         ? Unirest.get(internal + path).header('Authorization', auth).header('Accept', 'application/json').asString()
         : Unirest.post(internal + path).header('Authorization', auth).header('Accept', 'application/json')
             .header('Content-Type', 'application/json').body(JsonOutput.toJson(body)).asString()
@@ -94,7 +102,11 @@ def internalCall = { String path, Object body = null, int tries = 1 ->
       status = 0
     }
     if (status != 0 && status != 429 && status < 500) break
-    if (attempt < tries) Thread.sleep(2000L * attempt)
+    if (attempt < 3) {
+      String after = r ? r.headers.getFirst('Retry-After') : ''
+      Thread.sleep(after?.isInteger() ? after.toInteger() * 1000L : wait + (long) (Math.random() * 500))
+      wait = Math.min(wait * 2, 15000L)
+    }
   }
   throw new IllegalStateException("${path.tokenize('?')[0]} answered ${status}")
 }
@@ -129,11 +141,18 @@ def pushKind = { String kind, String text ->
       'X-Automap-Kind'  : kind,
     ]
     if (seq == parts.size() - 1) { h['X-Automap-Last'] = '1'; h['X-Automap-Sha256'] = whole }
-    for (int tries = 1; tries <= 3; tries++) {
+    int tries = 1
+    for (; tries <= 3; tries++) {
       try { r = Unirest.post(cfg('AUTOMAP_URL')).headers(h).body(parts[seq]).asString() } catch (Exception e) { r = null }
       int st = r ? r.status : 0
       if (st != 0 && st < 500 && st != 429) break
       if (tries < 3) Thread.sleep(1000L << tries)
+    }
+    if (r && r.status == 409 && tries > 1 && seq == parts.size() - 1) {
+      // the first copy of the last chunk was taken and closed the run; its answer was lost
+      // on the way back. Nothing to send again: the push is done.
+      say("${kind} (beta): the last chunk was already taken; the push went through")
+      return [status: 202, body: '{"accepted":true,"queued":true}']
     }
     if (!r || r.status != 202) break
   }
@@ -220,7 +239,9 @@ def pushRuns = { ->
     long nowMs = System.currentTimeMillis()
     long start = nowMs - days * 86400000L
     start -= start % 86400000L          // whole days, so a day pushed is a day complete
-    def fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'.000Z'")
+    // the log is newest first and paged by offset: runs landing while it is read would
+    // shift every page, so the read ends at the instant the window does (toTime)
+    def fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
     fmt.timeZone = TimeZone.getTimeZone('UTC')
     def dayOf = { long ms -> def f = new java.text.SimpleDateFormat('yyyy-MM-dd'); f.timeZone = TimeZone.getTimeZone('UTC'); f.format(new Date(ms)) }
     List records = []
@@ -228,7 +249,7 @@ def pushRuns = { ->
       if (System.currentTimeMillis() - STARTED > BUDGET_MS) {
         throw new IllegalStateException("the audit log of ${days} days did not fit in this run; set AUTOMAP_RUNS_DAYS lower")
       }
-      def page = internalCall('auditlog', [fromTime: fmt.format(new Date(start)), offset: offset, limit: 50], 3)?.items?.items ?: []
+      def page = internalCall('auditlog', [fromTime: fmt.format(new Date(start)), toTime: fmt.format(new Date(nowMs)), offset: offset, limit: 50])?.items?.items ?: []
       records.addAll(page)
       if (page.size() < 50) break
     }
@@ -266,7 +287,7 @@ def pushRuns = { ->
         if (budget <= 0 || System.currentTimeMillis() - STARTED > BUDGET_MS) return
         budget -= 1
         def detail
-        try { detail = internalCall("auditlog/item/${r.id}", null, 3) } catch (Exception ignore) { return }
+        try { detail = internalCall("auditlog/item/${r.id}") } catch (Exception ignore) { return }
         (detail?.content?.componentLogs ?: []).each { cl ->
           def res = cl.executionResult ?: [:]
           def keys = (cl.changes ?: []).findAll { it?.payload?.type == 'ERROR' }.collect { it.payload.key ?: '' }

@@ -46,12 +46,12 @@
   },
   "x-automap-senders": {
     "description": "The senders we publish (github.com/MOY-Apps/automap-sync), the lowest version the receiver takes, the latest one, and every version released. A sender below `min` gets 426 upgrade; below `latest` it is taken and the settings page says an update is out. Any other name, or no X-Automap-Sender header, is taken unnamed.",
-    "python": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
-    "node": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
-    "bash": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
-    "powershell": { "min": "1.0.0", "latest": "1.2.0", "released": ["1.0.0", "1.1.0", "1.2.0"] },
-    "scriptrunner": { "min": "1.0.0", "latest": "1.4.0", "released": ["1.0.0", "1.0.1", "1.1.0", "1.2.0", "1.2.1", "1.3.0", "1.4.0"] },
-    "jmwe": { "min": "1.0.0", "latest": "1.4.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.2.1", "1.3.0", "1.4.0"] }
+    "python": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.3.0"] },
+    "node": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.3.0"] },
+    "bash": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.3.0"] },
+    "powershell": { "min": "1.0.0", "latest": "1.3.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.3.0"] },
+    "scriptrunner": { "min": "1.0.0", "latest": "1.5.0", "released": ["1.0.0", "1.0.1", "1.1.0", "1.2.0", "1.2.1", "1.3.0", "1.4.0", "1.5.0"] },
+    "jmwe": { "min": "1.0.0", "latest": "1.5.0", "released": ["1.0.0", "1.1.0", "1.2.0", "1.2.1", "1.3.0", "1.4.0", "1.5.0"] }
   },
   "paths": {
     "/v1": {

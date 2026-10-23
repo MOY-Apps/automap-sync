@@ -1,4 +1,5 @@
 #!/usr/bin/env pwsh
+#Requires -Version 7.2
 <#
 .SYNOPSIS
   automap-sync (PowerShell) - push this site's automation rules to Automation Map.
@@ -18,6 +19,12 @@
   Exit codes: 0 pushed (or dry run), 2 configuration, 3 Atlassian API, 4 refused by
   the receiver, 5 try later, 6 failed.
 
+  From 1.3.0: a 409 to a last chunk sent again (its first answer lost) means the receiver
+  took the first copy - the push is done, no second run; the audit log is read up to the
+  instant the window ends (toTime) and, cut at 50,000 records, pushed from its first
+  complete day; the internal API is retried like the Automation API, honouring Retry-After.
+  Needs 7.2: SkipHttpErrorCheck and SHA256::HashData are not in Windows PowerShell 5.1.
+
   Usage and runs (BETA, from 1.1.0), as in the Python sender: after the rules, this
   month's steps, Rovo credits and flow runs per rule, and the audit log of the last
   AUTOMAP_RUNS_DAYS days folded into per-rule, per-day counts, are read from the internal
@@ -34,7 +41,7 @@ param([switch]$DryRun)
 
 $ErrorActionPreference = 'Stop'
 $Name = 'powershell'
-$Version = '1.2.0'
+$Version = '1.3.0'
 $UA = "automap-sync-$Name/$Version"
 $Refused = @(400, 401, 402, 403, 404, 405, 413, 426)
 
@@ -60,6 +67,19 @@ function Invoke-Http([string]$method, [string]$url, [hashtable]$headers = @{}, [
   }
 }
 
+# Sleep Retry-After seconds when given, else $wait with jitter; answers the next wait (doubling to 15 s).
+function Start-Pause($headers, [double]$wait) {
+  $after = 0
+  if ($headers -and $headers['Retry-After']) { [int]::TryParse([string]($headers['Retry-After'] | Select-Object -First 1), [ref]$after) | Out-Null }
+  Start-Sleep -Milliseconds ([int]($(if ($after -gt 0) { $after * 1000 } else { $wait * 1000 + (Get-Random -Maximum 500) })))
+  return [Math]::Min($wait * 2, 15)
+}
+
+# The JSON of a 200, or exit 3: a proxy's HTML page is an Atlassian-side failure, not a crash.
+function Read-Json([string]$text, [string]$what) {
+  try { return ($text | ConvertFrom-Json) } catch { Stop-Sync 3 "the Automation API answered 200 with a body that is not JSON for $what" }
+}
+
 $DryRun = $DryRun -or ($env:AUTOMAP_DRY_RUN -eq '1')
 $email = Get-Setting 'ATLASSIAN_EMAIL'
 $token = Get-Setting 'ATLASSIAN_API_TOKEN'
@@ -72,27 +92,28 @@ if ([string]::IsNullOrEmpty($cloud)) {
   if ($site -notmatch '://') { $site = "https://$site" }
   $r = Invoke-Http 'GET' ($site.TrimEnd('/') + '/_edge/tenant_info')
   if ($r.Status -ne 200) { Stop-Sync 3 "could not read the cloud id of $site (HTTP $($r.Status))" }
-  $cloud = ($r.Text | ConvertFrom-Json).cloudId
+  $cloud = (Read-Json $r.Text 'the cloud id').cloudId
 }
 $base = "$api/automation/public/jira/$cloud/rest/v1"
 
-function Get-Atlassian([string]$path) {
+# The text of a 200; $what names the read in the log ("the rule list", "rule 3 of 40"), never the rule's id.
+function Get-Atlassian([string]$path, [string]$what) {
   $wait = 1.0
   for ($attempt = 1; $attempt -le 5; $attempt++) {
     $r = Invoke-Http 'GET' ($base + $path) @{ Authorization = $auth; Accept = 'application/json' }
-    if ($r.Status -eq 200) { return $r.Text }
+    if ($r.Status -eq 200) {
+      try { [System.Text.Json.JsonDocument]::Parse($r.Text).Dispose() } catch { Stop-Sync 3 "the Automation API answered 200 with a body that is not JSON for $what" }
+      return $r.Text
+    }
     if ($r.Status -eq 401) { Stop-Sync 3 'the Automation API rejected the token (401): it must be an API token with the Automation scope, for this e-mail' }
     if ($r.Status -eq 403) { Stop-Sync 3 'the Automation API refused access (403): the account must be a Jira administrator' }
     if (($r.Status -eq 0 -or $r.Status -eq 429 -or $r.Status -ge 500) -and $attempt -lt 5) {
-      $after = 0
-      if ($r.Headers -and $r.Headers['Retry-After']) { [int]::TryParse([string]($r.Headers['Retry-After'] | Select-Object -First 1), [ref]$after) | Out-Null }
-      Start-Sleep -Milliseconds ([int]($(if ($after -gt 0) { $after * 1000 } else { $wait * 1000 + (Get-Random -Maximum 500) })))
-      $wait = [Math]::Min($wait * 2, 15)
+      $wait = Start-Pause $r.Headers $wait
       continue
     }
-    Stop-Sync 3 "the Automation API answered $($r.Status) for $($path.Split('?')[0])"
+    Stop-Sync 3 "the Automation API answered $($r.Status) for $what"
   }
-  Stop-Sync 3 'gave up on the Automation API'
+  Stop-Sync 3 "gave up on the Automation API reading $what"
 }
 
 # the list of rules, page by page
@@ -103,7 +124,7 @@ $pages = 0
 do {
   $q = 'limit=100'
   if ($cursor) { $q += '&cursor=' + [Uri]::EscapeDataString($cursor) }
-  $page = (Get-Atlassian "/rule/summary?$q") | ConvertFrom-Json
+  $page = (Get-Atlassian "/rule/summary?$q" 'the rule list') | ConvertFrom-Json
   $pages++
   foreach ($item in @($page.data)) {
     $id = if ($item.id) { [string]$item.id } else { [string]$item.uuid }
@@ -118,7 +139,7 @@ Write-Log "$($ids.Count) rules listed in $pages page(s)"
 # each rule as the API wrote it, wrapped in "rule"
 $parts = [System.Collections.Generic.List[string]]::new()
 foreach ($id in $ids) {
-  $text = Get-Atlassian ('/rule/' + [Uri]::EscapeDataString($id))
+  $text = Get-Atlassian ('/rule/' + [Uri]::EscapeDataString($id)) "rule $($parts.Count + 1) of $($ids.Count)"
   $doc = [System.Text.Json.JsonDocument]::Parse($text)
   # the rule as the API wrote it: inside "rule" when wrapped, the whole answer when bare.
   # Properties are walked rather than TryGetProperty'd: PowerShell cannot bind the [ref]
@@ -176,6 +197,12 @@ function Send-Rules {
       }
       if ($r.Status -eq 202) { continue }
       $w = Get-Word $r.Text
+      if ($r.Status -eq 409 -and $tries -gt 1 -and $seq -eq $chunks.Count - 1) {
+        # the first copy of the last chunk was taken and closed the run; its answer was
+        # lost on the way back. A new run would load the same rules twice.
+        Write-Log "the last chunk was already taken: pushed $($data.Length) bytes in $($chunks.Count) chunk(s); the map is rebuilding"
+        return @{ Code = 0; Say = '' }
+      }
       if (($r.Status -eq 409 -or $r.Status -eq 422) -and $attempt -eq 1) {
         Write-Log "receiver answered $($r.Status) $w; starting the push again"
         $restart = $true
@@ -225,31 +252,41 @@ function Send-Kind([string]$kind, [string]$payload) {
       if ($r.Status -ne 0 -and $r.Status -lt 500 -and $r.Status -ne 429) { break }
       if ($tries -lt 3) { Start-Sleep -Seconds ([Math]::Pow(2, $tries)) }
     }
+    if ($r.Status -eq 409 -and $tries -gt 1 -and $seq -eq $parts.Count - 1) {
+      # the first copy of the last chunk was taken and closed the run; its answer was lost
+      # on the way back. Nothing to send again: the push is done.
+      Write-Log "$kind (beta): the last chunk was already taken; the push went through"
+      $r = @{ Status = 202; Headers = $r.Headers; Text = '{"accepted":true,"queued":true}' }
+    }
     if ($r.Status -ne 202) { break }
   }
   return $r
 }
 
-# The internal API behind Jira's Usage and Audit log tabs (BETA, undocumented): throws on any
-# answer but 200, which the callers turn into "skipped".
-function Get-Internal([string]$path, $body = $null, [int]$tries = 1) {
+# The internal API behind Jira's Usage and Audit log tabs (BETA, undocumented): a 429
+# (Retry-After honoured), a 5xx or no answer is tried three times with the Automation API's
+# backoff; anything else throws, which the callers turn into "skipped".
+function Get-Internal([string]$path, $body = $null) {
   $h = @{ Authorization = $auth; Accept = 'application/json' }
   $status = 0
-  for ($attempt = 1; $attempt -le $tries; $attempt++) {
+  $wait = 1.0
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
     if ($null -ne $body) {
       $p = @{ Method = 'POST'; Uri = $internal + $path; Headers = $h; UserAgent = $UA; SkipHttpErrorCheck = $true
               Body = ($body | ConvertTo-Json -Compress); ContentType = 'application/json' }
     } else {
       $p = @{ Method = 'GET'; Uri = $internal + $path; Headers = $h; UserAgent = $UA; SkipHttpErrorCheck = $true }
     }
+    $headers = @{}
     try {
       $r = Invoke-WebRequest @p
       $status = [int]$r.StatusCode
+      $headers = $r.Headers
       $text = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
     } catch { $status = 0; $text = '' }
     if ($status -eq 200) { return ($text | ConvertFrom-Json) }
     if ($status -ne 0 -and $status -ne 429 -and $status -lt 500) { break }
-    if ($attempt -lt $tries) { Start-Sleep -Seconds (2 * $attempt) }
+    if ($attempt -lt 3) { $wait = Start-Pause $headers $wait }
   }
   throw "$($path.Split('?')[0]) answered $status"
 }
@@ -341,12 +378,33 @@ function Send-Runs {
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $start = $nowMs - [long]$days * 86400000
     $start -= $start % 86400000          # whole days, so a day pushed is a day complete
-    $from = [DateTimeOffset]::FromUnixTimeMilliseconds($start).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'.000Z'")
+    # the log is newest first and paged by offset: runs landing while it is read would shift
+    # every page, so the read ends at the instant the window does (toTime)
+    $iso = { param([long]$ms) [DateTimeOffset]::FromUnixTimeMilliseconds($ms).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'") }
+    $from = & $iso $start
+    $to = & $iso $nowMs
     $records = [System.Collections.Generic.List[object]]::new()
-    for ($offset = 0; $offset -lt 50000; $offset += 50) {   # 50 a page whatever is asked; `total` is always 0
-      $page = @((Get-Internal 'auditlog' ([ordered]@{ fromTime = $from; offset = $offset; limit = 50 }) 3).items.items | Where-Object { $_ })
+    $capped = $false
+    for ($offset = 0; ; $offset += 50) {   # 50 a page whatever is asked; `total` is always 0
+      $page = @((Get-Internal 'auditlog' ([ordered]@{ fromTime = $from; toTime = $to; offset = $offset; limit = 50 })).items.items | Where-Object { $_ })
       foreach ($x in $page) { $records.Add($x) }
       if ($page.Count -lt 50) { break }
+      if ($offset + 50 -ge 50000) { $capped = $true; break }   # 1,000 pages: past that the oldest day read is not whole
+    }
+    if ($capped) {
+      # the oldest day read is cut short: pushed whole, it would replace the map's complete
+      # count with a smaller one - so the window starts the day after it
+      $at = { param($r) if ($r.eventTimestamp) { [long]$r.eventTimestamp } elseif ($r.startTime) { [long]$r.startTime } else { [long]0 } }
+      $oldest = [long]::MaxValue
+      foreach ($x in $records) { $t = & $at $x; if ($t -and $t -lt $oldest) { $oldest = $t } }
+      if ($oldest -eq [long]::MaxValue) { $oldest = $start }
+      $cut = $oldest - ($oldest % 86400000) + 86400000
+      if ($cut -gt $nowMs) { throw 'more than 50000 runs in one day: no day of the window is complete' }
+      $kept = [System.Collections.Generic.List[object]]::new()
+      foreach ($x in $records) { if ((& $at $x) -ge $cut) { $kept.Add($x) } }
+      $records = $kept
+      Write-Log "runs (beta): the audit log is longer than 50000 records; the window was shortened to start $([DateTimeOffset]::FromUnixTimeMilliseconds($cut).UtcDateTime.ToString('yyyy-MM-dd'))"
+      if ($cut -gt $start) { $start = $cut }
     }
     $rows = [ordered]@{}
     $failed = [ordered]@{}
@@ -382,7 +440,7 @@ function Send-Runs {
       foreach ($r in @($failed[$u] | Sort-Object { - [long](Get-Or0 $_.eventTimestamp) } | Select-Object -First 2)) {
         if ($budget -le 0) { break }
         $budget--
-        try { $detail = Get-Internal "auditlog/item/$($r.id)" $null 3 } catch { continue }
+        try { $detail = Get-Internal "auditlog/item/$($r.id)" } catch { continue }
         foreach ($cl in @($detail.content.componentLogs | Where-Object { $_ })) {
           $res = $cl.executionResult
           $keys = @($cl.changes | Where-Object { $_ -and $_.payload -and $_.payload.type -eq 'ERROR' } | ForEach-Object { [string]$_.payload.key })

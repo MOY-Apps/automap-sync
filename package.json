@@ -1,6 +1,6 @@
 {
   "name": "automap-sync",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "Push your Jira automation rules to Automation Map for Jira; the Atlassian token stays with you",
   "license": "SEE LICENSE IN LICENSE",
