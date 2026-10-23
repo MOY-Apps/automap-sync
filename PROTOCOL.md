@@ -235,7 +235,7 @@ Atlassian). Read the **status code**; the `error` word separates the two 429s.
 | 426 | `upgrade` — this sender version is below the minimum | update the image or the script; exit 4 |
 | 422 | `checksum` — the joined chunks do not match the SHA-256 or the length; the build is marked failed, nothing loaded, the previous map stays | start a new run; if it repeats, check for line breaks or a body altered in transit |
 | 429 | `allowance` — the plan's loads are used up (Basic 7 in 7 days, Advanced 5 a day) | stop this run; the settings page says when the next load is possible. Schedule the sender within the allowance |
-| 429 | `rate-limited` — over 300 requests per key in 10 minutes | wait ten minutes, then start a new run |
+| 429 | `rate-limited` — over 300 requests to this installation in 10 minutes, counted before the key is checked, so with or without one | wait ten minutes, then start a new run |
 | 500 | `failed` — the receiver could not store the chunk | retry the same chunk with backoff, then start a new run |
 
 What actually happened — loaded, refused as another site's, failed — is shown on the
@@ -255,6 +255,9 @@ not do this for you — every completed run is a build).
   (`GET` on summaries and rules). It is never sent to the app.
 - The app's key is 32 random bytes; the app stores only its SHA-256 and compares in
   constant time. One key per site; a new key revokes the old one immediately.
+- Every request is counted against the throttle before the key is read, so a caller that
+  has the URL but not the key gets `401` up to the limit and `429 rate-limited` past it,
+  like anyone else: guessing at the key cannot run unmetered.
 - The receiver cannot return data: its responses are fixed in the manifest.
 - Rule configurations can contain credentials typed into rules (and, per AUTO-2211, hidden
   header values). The sender passes them through TLS to the app, where the build replaces
