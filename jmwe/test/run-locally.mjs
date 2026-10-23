@@ -13,7 +13,8 @@
  *
  * ATLASSIAN_SITE may carry a scheme (http://127.0.0.1:port) to point the template at the
  * fake site; requests the template makes to https://<site> and https://api.atlassian.com
- * are then sent there. Prints the template's one-line result.
+ * are then sent there. AUTOMAP_NOW_MS (Unix ms) fixes the `now` global, so a test can
+ * place the usage template's hourly slice. Prints the template's one-line result.
  */
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
@@ -83,8 +84,10 @@ export function render(templateText) {
   const e = new nunjucks.Environment(null, { autoescape: false });
   e.addFilter('callRest', (url, kw) => callRest(url, kw || {}));
   e.addFilter('date', (value, fmt) => (fmt === 'x' ? String(new Date(value || Date.now()).getTime()) : new Date(value || Date.now()).toISOString()));
-  // JMWE_NO_CLOCK=1: a JMWE without the `now` global, which a part must refuse to run on
-  if (process.env.JMWE_NO_CLOCK !== '1') e.addGlobal('now', new Date());
+  // JMWE_NO_CLOCK=1: a JMWE without the `now` global, which a part must refuse to run on;
+  // AUTOMAP_NOW_MS: the clock stopped at that instant (tests only)
+  const nowMs = /^\d+$/.test(process.env.AUTOMAP_NOW_MS || '') ? Number(process.env.AUTOMAP_NOW_MS) : Date.now();
+  if (process.env.JMWE_NO_CLOCK !== '1') e.addGlobal('now', new Date(nowMs));
   return e.renderString(templateText, {});
 }
 
@@ -113,6 +116,8 @@ export function filled() {
   // PART, the rules template's slice setting ("1/2"), as ScriptRunner takes it from a Script Variable
   if (process.env.PART !== undefined) t = t.replace('{%- set PART = "" -%}', `{%- set PART = ${JSON.stringify(process.env.PART)} -%}`);
   if (/^\d+$/.test(process.env.AUTOMAP_RUNS_DAYS || '')) t = t.replace('{%- set RUNS_DAYS = 1 -%}', `{%- set RUNS_DAYS = ${process.env.AUTOMAP_RUNS_DAYS} -%}`);
+  // RUNS_MODE, the usage template's "slice" (an hour each run, 1.6.0) or "days" (RUNS_DAYS whole days)
+  if (process.env.AUTOMAP_RUNS_MODE !== undefined) t = t.replace('{%- set RUNS_MODE = "slice" -%}', `{%- set RUNS_MODE = ${JSON.stringify(process.env.AUTOMAP_RUNS_MODE)} -%}`);
   return t;
 }
 

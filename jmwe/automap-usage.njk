@@ -5,18 +5,28 @@
 
   A Nunjucks template for JMWE's "Build-your-own (scripted) post-function", run by a
   Scheduled action whose JQL matches ONE anchor work item (e.g. key = OPS-1). A usage push
-  spends no load of the map, so run it every hour: each run reads only yesterday and today
-  (RUNS_DAYS = 1), which fits a JMWE action on any site, and the map keeps 35 days. Fill the same five values as in automap-sync.njk.
+  spends no load of the map, so run it every hour: each run reads one hour of the audit
+  log, which fits a JMWE action on any site, and the map keeps 35 days. Fill the same five
+  values as in automap-sync.njk.
 
   Reads this month's steps, Rovo credits and flow runs per rule, and the audit log of the
-  last RUNS_DAYS days folded into per-rule, per-day counts, from the internal API behind
+  previous full UTC hour folded into per-rule, per-day counts, from the internal API behind
   Jira's Usage and Audit log tabs, and pushes them as two separate pushes, each proven by
   X-Automap-Length. That API is undocumented and can change: a failure there is reported
-  in the result line. No account ids, no issue ids and no message text leave. Each push is
-  one chunk of at most 80 000 characters, so on a very large site only the busiest rules
-  are kept. Set USAGE or RUNS to false to leave either out; if the audit log has more than
-  RUNS_MAX_PAGES pages of 50, the runs are left out rather than sent in part - set
-  RUNS_DAYS lower.
+  in the result line. No account ids, no issue ids and no message text leave. Set USAGE or
+  RUNS to false to leave either out.
+
+  The runs go as hourly SLICES (1.6.0): a run at 10:05 reads 09:00:00.000 up to (not
+  including) 10:00:00.000 UTC and pushes it as one slice; the map adds it to the day and
+  takes each hour once, so the same hour pushed again changes nothing. The hour is cut by
+  the clock, not by what was pushed before: a run that did not happen (the action paused
+  or disabled for a while) leaves its hour out of the map. Schedule the action every hour,
+  and run ONE copy of it. RUNS_MODE = "days" is the behaviour before 1.6.0: the last
+  RUNS_DAYS whole days (1 = yesterday and today), each push replacing those days on the map;
+  for a one-off backfill, then back to "slice". If the audit log has more than
+  RUNS_MAX_PAGES pages of 50, the runs are left out rather than sent in part - a partial
+  slice would count as the whole hour; an hour is a few pages and never gets there, and in
+  days mode RUNS_DAYS lower is the fix.
 
   Every request is tried up to three times when it gets no answer (a timeout), a 429 or
   a 5xx - at once, since a template cannot wait. The audit log is read up to the instant
@@ -35,12 +45,16 @@
 {%- set KEY = "the amk_ key from Automation Map" -%}
 {%- set USAGE = true -%}
 {%- set RUNS = true -%}
+{%- set RUNS_MODE = "slice" -%}
 {%- set RUNS_DAYS = 1 -%}
 {%- set RUNS_MAX_PAGES = 60 -%}
 
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.5.0" -%}
+{%- set VERSION = "1.6.0" -%}
+{%- if RUNS_MODE != "slice" and RUNS_MODE != "days" -%}
+automap-sync {{ NAME }} {{ VERSION }} usage: failed - [2] RUNS_MODE must be "slice" or "days", not "{{ RUNS_MODE }}"
+{%- else -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
 {%- set failures = [] -%}
@@ -231,13 +245,24 @@
 {{- ymd(ms // 86400000) | trim }}T{{ ("0" if hh < 10 else "") + hh }}:{{ ("0" if mi < 10 else "") + mi }}:{{ ("0" if ss < 10 else "") + ss }}.{{ ("00" if ml < 10 else ("0" if ml < 100 else "")) + ml }}Z
 {%- endmacro -%}
 {%- if RUNS and not shut and not closed.length -%}
+  {%- set slice = RUNS_MODE == "slice" -%}
   {%- set days = (RUNS_DAYS if RUNS_DAYS >= 1 else 1) if RUNS_DAYS <= 30 else 30 -%}
-  {%- set startDay = dayNow - days -%}
-  {%- set startMs = startDay * 86400000 -%}
+  {%- if slice -%}
+    {#- the previous full UTC hour, half-open [startMs, endMs): at 10:05, 09:00:00.000 to 10:00:00.000 -#}
+    {%- set endMs = nowMs - (nowMs % 3600000) -%}
+    {%- set startMs = endMs - 3600000 -%}
+    {%- set h1 = (startMs % 86400000) // 3600000 -%}{%- set h2 = (endMs % 86400000) // 3600000 -%}
+    {%- set span = "slice " + ("0" if h1 < 10 else "") + h1 + ":00–" + ("0" if h2 < 10 else "") + h2 + ":00 UTC" -%}
+  {%- else -%}
+    {#- whole days (the behaviour before 1.6.0): yesterday and today, or RUNS_DAYS of them -#}
+    {%- set startMs = (dayNow - days) * 86400000 -%}
+    {%- set endMs = nowMs -%}
+    {%- set span = "yesterday and today" if days == 1 else "last " + days + " days" -%}
+  {%- endif -%}
   {#- the log is newest first and paged by offset: runs landing while it is read would
       shift every page, so the read ends at the instant the window does (toTime) -#}
   {#- a macro's output is a SafeString: "" + makes it the plain text the API gets -#}
-  {%- set window = { "fromTime": (ymd(startDay) | trim) + "T00:00:00.000Z", "toTime": "" + (iso(nowMs) | trim) } -%}
+  {%- set window = { "fromTime": "" + (iso(startMs) | trim), "toTime": "" + (iso(endMs) | trim) } -%}
   {%- set rStop = [] -%}
   {%- set records = [] -%}
   {%- set more = [1] -%}
@@ -245,7 +270,9 @@
   {%- for pg in range(0, RUNS_MAX_PAGES + 1) -%}
     {%- if more.length and not rStop.length -%}
       {%- if pg >= RUNS_MAX_PAGES -%}
-        {%- set _ = rStop.push("runs (beta) skipped: the audit log of " + days + " days is longer than " + RUNS_MAX_PAGES + " pages; set RUNS_DAYS lower") -%}
+        {#- never a part of it: a partial slice would count as the whole hour -#}
+        {%- set _ = rStop.push(("runs (beta) skipped: the audit log of " + span + " is longer than " + RUNS_MAX_PAGES + " pages; that hour is left out") if slice
+            else ("runs (beta) skipped: the audit log of " + days + " days is longer than " + RUNS_MAX_PAGES + " pages; set RUNS_DAYS lower")) -%}
       {%- else -%}
         {%- set abox = [] -%}
         {%- set _ = fetch(abox, INTERNAL + "auditlog", "post", { "fromTime": window.fromTime, "toTime": window.toTime, "offset": pg * 50, "limit": 50 }) -%}
@@ -254,8 +281,12 @@
           {%- set _ = rStop.push("runs (beta) skipped: auditlog answered " + (a._statusCode or "nothing")) -%}
         {%- else -%}
           {%- set got = (a.items.items if a.items else []) or [] -%}
-          {%- for x in got -%}{%- set _ = records.push(x) -%}{%- endfor -%}
-          {%- if got.length < 50 -%}{%- set _ = more.pop() -%}{%- endif -%}
+          {%- for x in got -%}
+            {%- set _ = records.push(x) -%}
+            {#- newest first: a record from before the window's start ends the read -#}
+            {%- if slice and more.length and ((x.eventTimestamp or x.startTime or endMs) < startMs) -%}{%- set _ = more.pop() -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if got.length < 50 and more.length -%}{%- set _ = more.pop() -%}{%- endif -%}
         {%- endif -%}
       {%- endif -%}
     {%- endif -%}
@@ -270,7 +301,7 @@
     {%- set failed = [] -%}
     {%- for r in records -%}
       {%- set t = r.eventTimestamp or r.startTime -%}
-      {%- if r.ruleIdUuid and t and t >= startMs -%}
+      {%- if r.ruleIdUuid and t and t >= startMs and (t < endMs or not slice) -%}
         {%- set day = ymd(t // 86400000) | trim -%}
         {%- set k = r.ruleIdUuid + "|" + day -%}
         {%- set at = keys.indexOf(k) -%}
@@ -335,10 +366,12 @@
       {%- set _ = rowsJson.push(one) -%}
       {%- set _ = totals.splice(0, 2, totals[0] + o.n, totals[1] + cErr[i]) -%}
     {%- endfor -%}
-    {%- set doc = '{"runs":{"window":' + ({ "start": startMs, "end": nowMs } | dump) + ',"rows":[' + rowsJson.join(",") + '],"errors":' + (errs | dump)
+    {#- a slice says so (mode); whole days are the document of 1.5.0, unchanged -#}
+    {%- set doc = '{"runs":{' + ('"mode":"slice",' if slice else '') + '"window":' + ({ "start": startMs, "end": endMs } | dump) + ',"rows":[' + rowsJson.join(",") + '],"errors":' + (errs | dump)
         + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
     {%- set said = "" + (pushKind("runs", doc) | trim) -%}
-    {%- set _ = notes.push(("runs (beta): not taken, receiver answered " + said) if said else ("runs (beta) " + ("yesterday and today" if days == 1 else "last " + days + " days") + ": pushed " + totals[0] + " runs, " + totals[1] + " with errors")) -%}
+    {%- set _ = notes.push(("runs (beta): not taken, receiver answered " + said) if said else ("runs (beta) " + span + ": pushed " + totals[0] + " runs, " + totals[1] + " with errors")) -%}
   {%- endif -%}
 {%- endif -%}
 automap-sync {{ NAME }} {{ VERSION }} usage: {{ notes.join("; ") if notes.length else "nothing to do: USAGE and RUNS are both false" }}
+{%- endif -%}

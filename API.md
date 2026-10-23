@@ -401,8 +401,9 @@ What each released version of our senders sends. The Docker image
 | 1.4.0 | scriptrunner, jmwe | rules in parts (`PART=N/M`, `X-Automap-Part`), for sites past the host's time limit |
 | 1.3.0 | python, node, bash, powershell | as 1.2.0 on the wire to the receiver. A `409` to a resent last chunk ends the push instead of starting a second run; the audit log is read with `toTime` and, past 50,000 records, pushed from its first complete day; the internal API is retried honouring `Retry-After` |
 | 1.5.0 | scriptrunner, jmwe | as 1.4.0 on the wire to the receiver. Parts cut by each rule's own id (roughly equal slices); the resent-`409` rule above; JMWE retries every request (at once) and restarts once on `409`/`422` |
+| 1.6.0 | scriptrunner, jmwe | the usage job pushes the runs as hourly **slices**: `runs.mode: "slice"`, `window` the previous full UTC hour, half-open; the receiver adds each hour once. `RUNS_MODE=days` is 1.5.0's whole days |
 
-Latest today: python, node, bash and powershell **1.3.0**; scriptrunner and jmwe **1.5.0**.
+Latest today: python, node, bash and powershell **1.3.0**; scriptrunner and jmwe **1.6.0**.
 The same list is in [`openapi.json`](openapi.json) under `x-automap-senders`.
 
 ### Old senders keep working
