@@ -201,8 +201,10 @@ document the build reads, and builds once.
   the rules of every part in part order, a rule carried by two parts kept once (the later
   part's copy - the job that ran later read the newer rule; by `uuid`, or `id` without
   one), `sender` from the part that completed the group, and `"parts": M` added. The
-  document is written compact and ASCII under `push-<run>` in chunks of 200 KB, the parts'
-  chunks go, and the build is queued exactly as for a plain push. The settings page says
+  document is written compact and ASCII under `push-<run>` in chunks of 200 KB, the build
+  is queued exactly as for a plain push, and only then do the parts' chunks and marks go -
+  a queue that refuses the build leaves every part in place for the job's retry, rather
+  than a run nothing can finish. The settings page says
   "merging them now" in between, then "in M parts". A merge the database let fail is tried
   three times; after that the row is open again, every part still in, and running any one
   job again (its last chunk completes the group once more) starts the merge over - the
