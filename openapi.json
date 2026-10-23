@@ -33,11 +33,12 @@
     "rateLimit": 300,
     "rateWindowSeconds": 600,
     "maxFlows": 10000,
-    "runsMaxRows": 20000,
+    "runsMaxRows": 100000,
+    "runsMaxRulesPerDay": 20000,
     "runsMaxErrors": 500,
     "runsMaxWindowDays": 31,
     "runsKeepDays": 35,
-    "description": "maxChunkBytes: one request body, in UTF-8 bytes (413 above it). recommendedChunkBytes: what the published senders send; the platform fails bodies near 800 KB before the app runs. maxChunks: chunks in one run (X-Automap-Seq 0 to 399; 400 or more is a 400). rateLimit: requests per rateWindowSeconds for one installation's key, counted for every request whose key matches, refused ones included (429 rate-limited); the window is fixed, not rolling. maxFlows: Atlassian lists at most 10,000 rules a month and Advanced keeps every rule a usage push carries; 10,000 is the cap the app applies where a plan sets no figure. runsMaxRows / runsMaxErrors: rows and errors of one runs push that are kept, the rest dropped. runsMaxWindowDays: a runs window longer than this is a 400. runsKeepDays: how many days of runs the app keeps."
+    "description": "maxChunkBytes: one request body, in UTF-8 bytes (413 above it). recommendedChunkBytes: what the published senders send; the platform fails bodies near 800 KB before the app runs. maxChunks: chunks in one run (X-Automap-Seq 0 to 399; 400 or more is a 400). rateLimit: requests per rateWindowSeconds for one installation's key, counted for every request whose key matches, refused ones included (429 rate-limited); the window is fixed, not rolling. maxFlows: Atlassian lists at most 10,000 rules a month and Advanced keeps every rule a usage push carries; 10,000 is the cap the app applies where a plan sets no figure. runsMaxRows: rows of one runs push that are kept; past it the push keeps its newest days whole and drops the oldest, and the window starts at the first day kept (those days are not replaced). runsMaxRulesPerDay: rows of one day that are kept, the rest of that day dropped. runsMaxErrors: errors of one push that are kept, the rest dropped. runsMaxWindowDays: a runs window longer than this is a 400. runsKeepDays: how many days of runs the app keeps."
   },
   "x-automap-plans": {
     "basic": { "push": false, "usage": false },
@@ -530,7 +531,7 @@
           },
           "rows": {
             "type": "array",
-            "description": "One row per rule and UTC day. The first 20,000 are kept. Rows with an invalid uuid or day are dropped; for a repeated (uuid, day) the last row wins.",
+            "description": "One row per rule and UTC day. At most 20,000 rows a day and 100,000 a push are kept: past the push cap the newest days are kept whole, the oldest dropped, and the window starts at the first day kept. Rows with an invalid uuid or day are dropped; for a repeated (uuid, day) the last row wins.",
             "items": { "$ref": "#/components/schemas/RunsRow" }
           },
           "errors": {
