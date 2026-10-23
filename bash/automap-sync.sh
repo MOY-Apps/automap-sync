@@ -22,11 +22,16 @@
 # Exit codes: 0 pushed (or dry run), 2 configuration, 3 Atlassian API, 4 refused by the
 # receiver, 5 try later, 6 failed.
 #
+# From 1.3.0: a 409 to a last chunk sent again (its first answer lost) means the receiver
+# took the first copy - the push is done, no second run; the audit log is read up to the
+# instant the window ends (toTime) and, cut at 50,000 records, pushed from its first complete
+# day; the internal API is retried like the Automation API, honouring Retry-After.
+#
 # Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
 set -u
 
 NAME=bash
-VERSION=1.2.0
+VERSION=1.3.0
 UA="automap-sync-$NAME/$VERSION"
 
 log() { printf 'automap-sync %s %s: %s\n' "$NAME" "$VERSION" "$*" >&2; }
@@ -63,25 +68,34 @@ else
 fi
 BASE="$API_BASE/automation/public/jira/$CLOUD/rest/v1"
 
-# api_get <path> <outfile> - GET with retries on 429, 5xx and no answer
+# pause <headers-file> - sleep Retry-After seconds when given, else $WAIT (doubling to 15)
+pause() {
+  local after
+  after="$(tr -d '\r' < "$1" 2>/dev/null | awk -F': *' 'tolower($1)=="retry-after"{print $2}' | head -1)"
+  case "$after" in ''|*[!0-9]*) sleep "$WAIT" ;; *) sleep "$after" ;; esac
+  WAIT=$(( WAIT * 2 > 15 ? 15 : WAIT * 2 ))
+}
+
+# api_get <path> <outfile> <what> - GET with retries on 429, 5xx and no answer; <what> names
+# the read in the log ("the rule list", "rule 3 of 40"), never the rule's id
 api_get() {
-  local path="$1" out="$2" wait=1 attempt=1 code after
+  local path="$1" out="$2" what="$3" attempt=1 code
+  WAIT=1
   while :; do
     code="$(curl -sS -A "$UA" -K "$TMP/atlassian.cfg" -H 'Accept: application/json' \
       -D "$TMP/h" -o "$out" -w '%{http_code}' "$BASE$path" 2>/dev/null)" || code=000
     case "$code" in
-      200) return 0 ;;
+      200) jq -e . "$out" >/dev/null 2>&1 && return 0
+           die 3 "the Automation API answered 200 with a body that is not JSON for $what" ;;
       401) die 3 "the Automation API rejected the token (401): it must be an API token with the Automation scope, for this e-mail" ;;
       403) die 3 "the Automation API refused access (403): the account must be a Jira administrator" ;;
     esac
     if [ "$attempt" -lt 5 ] && { [ "$code" = 000 ] || [ "$code" = 429 ] || [ "$code" -ge 500 ]; }; then
-      after="$(tr -d '\r' < "$TMP/h" 2>/dev/null | awk -F': *' 'tolower($1)=="retry-after"{print $2}' | head -1)"
-      case "$after" in ''|*[!0-9]*) sleep "$wait" ;; *) sleep "$after" ;; esac
-      wait=$(( wait * 2 > 15 ? 15 : wait * 2 ))
+      pause "$TMP/h"
       attempt=$(( attempt + 1 ))
       continue
     fi
-    die 3 "the Automation API answered $code for ${path%%\?*}"
+    die 3 "the Automation API answered $code for $what"
   done
 }
 
@@ -91,7 +105,7 @@ pages=0
 while :; do
   q="limit=100"
   [ -n "$cursor" ] && q="$q&cursor=$cursor"
-  api_get "/rule/summary?$q" "$TMP/page.json"
+  api_get "/rule/summary?$q" "$TMP/page.json" "the rule list"
   pages=$(( pages + 1 ))
   jq -r '.data[]? | (.id // .uuid) // empty' "$TMP/page.json" >> "$TMP/ids"
   next="$(jq -r '.links.next // empty' "$TMP/page.json")"
@@ -102,9 +116,12 @@ awk '!seen[$0]++' "$TMP/ids" > "$TMP/ids.unique"
 log "$(wc -l < "$TMP/ids.unique" | tr -d ' ') rules listed in $pages page(s)"
 
 : > "$TMP/rules.ndjson"
+n=0
+total="$(wc -l < "$TMP/ids.unique" | tr -d ' ')"
 while IFS= read -r id; do
+  n=$(( n + 1 ))
   enc="$(jq -rn --arg v "$id" '$v|@uri')"
-  api_get "/rule/$enc" "$TMP/detail.json"
+  api_get "/rule/$enc" "$TMP/detail.json" "rule $n of $total"
   jq -c '{rule: (.rule // .)}' "$TMP/detail.json" >> "$TMP/rules.ndjson"
 done < "$TMP/ids.unique"
 
@@ -152,6 +169,12 @@ push_rules() {
         sleep $(( 1 << tries ))
         tries=$(( tries + 1 ))
       done
+      # the first copy of the last chunk was taken and closed the run; its answer was lost
+      # on the way back. A new run would load the same rules twice.
+      if [ "$code" = 409 ] && [ "$tries" -gt 1 ] && [ "$seq" -eq $(( COUNT - 1 )) ]; then
+        log "the last chunk was already taken: pushed $BYTES bytes in $COUNT chunk(s); the map is rebuilding"
+        return
+      fi
       case "$code" in
         202) seq=$(( seq + 1 )); continue ;;
         409|422)
@@ -173,22 +196,24 @@ push_rules() {
 off() { eval "v=\${$1:-}"; case "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" in off|0|false|no) return 0 ;; esac; return 1; }
 INTERNAL="$API_BASE/automation/internal-api/jira/$CLOUD/pro/rest/GLOBAL/"
 
-# internal_get <path> <outfile> [tries] [json body] - the internal API behind Jira's Usage
-# and Audit log tabs (BETA, undocumented); 0 on 200, else 1 with ERR set
+# internal_get <path> <outfile> [json body] - the internal API behind Jira's Usage and Audit
+# log tabs (BETA, undocumented): a 429 (Retry-After honoured), a 5xx or no answer is tried
+# three times with the Automation API's backoff; 0 on 200, else 1 with ERR set
 internal_get() {
-  local path="$1" out="$2" tries="${3:-1}" body="${4:-}" attempt=1 code
+  local path="$1" out="$2" body="${3:-}" attempt=1 code
+  WAIT=1
   while :; do
     if [ -n "$body" ]; then
       code="$(printf '%s' "$body" | curl -sS -A "$UA" -K "$TMP/atlassian.cfg" -H 'Accept: application/json' \
-        -H 'Content-Type: application/json' -X POST --data-binary @- -o "$out" -w '%{http_code}' "$INTERNAL$path" 2>/dev/null)" || code=000
+        -H 'Content-Type: application/json' -X POST --data-binary @- -D "$TMP/ih" -o "$out" -w '%{http_code}' "$INTERNAL$path" 2>/dev/null)" || code=000
     else
       code="$(curl -sS -A "$UA" -K "$TMP/atlassian.cfg" -H 'Accept: application/json' \
-        -o "$out" -w '%{http_code}' "$INTERNAL$path" 2>/dev/null)" || code=000
+        -D "$TMP/ih" -o "$out" -w '%{http_code}' "$INTERNAL$path" 2>/dev/null)" || code=000
     fi
     [ "$code" = 200 ] && return 0
     if [ "$code" != 000 ] && [ "$code" != 429 ] && [ "$code" -lt 500 ]; then break; fi
-    [ "$attempt" -ge "$tries" ] && break
-    sleep $(( 2 * attempt ))
+    [ "$attempt" -ge 3 ] && break
+    pause "$TMP/ih"
     attempt=$(( attempt + 1 ))
   done
   ERR="${path%%\?*} answered $code"
@@ -219,6 +244,12 @@ send_kind() {
       sleep $(( 1 << tries ))
       tries=$(( tries + 1 ))
     done
+    # the first copy of the last chunk was taken and closed the run; its answer was lost on
+    # the way back. Nothing to send again: the push is done.
+    if [ "$KIND_CODE" = 409 ] && [ "$tries" -gt 1 ] && [ "$seq" -eq $(( count - 1 )) ]; then
+      log "$kind (beta): the last chunk was already taken; the push went through"
+      KIND_CODE=202
+    fi
     [ "$KIND_CODE" = 202 ] || return
     seq=$(( seq + 1 ))
   done
@@ -295,7 +326,7 @@ push_usage() {
 # push_runs - the audit log (BETA), folded into what the map needs; a failure is logged and the run goes on
 push_runs() {
   off AUTOMAP_RUNS && return
-  local days now start from offset n budget uuid id total bad
+  local days now start from to offset n budget uuid id total bad capped cut
   days="${AUTOMAP_RUNS_DAYS:-7}"
   case "$days" in ''|*[!0-9]*) days=7 ;; esac
   [ "$days" -lt 1 ] && days=1
@@ -303,18 +334,33 @@ push_runs() {
   now=$(( $(date +%s) * 1000 ))
   start=$(( now - days * 86400000 ))
   start=$(( start - start % 86400000 ))   # whole days, so a day pushed is a day complete
+  # the log is newest first and paged by offset: runs landing while it is read would shift
+  # every page, so the read ends at the instant the window does (toTime), ISO with milliseconds
   from="$(jq -rn --argjson s "$start" '$s / 1000 | floor | todate | sub("Z$"; ".000Z")')"
+  to="$(jq -rn --argjson s "$now" '($s / 1000 | floor | todate | sub("Z$"; "")) + "." + ($s % 1000 | tostring | ("000" + .)[-3:]) + "Z"')"
   : > "$TMP/r-records.ndjson"
   offset=0
-  while [ "$offset" -lt 50000 ]; do   # 50 a page whatever is asked; `total` is always 0
-    if ! internal_get auditlog "$TMP/r-page.json" 3 "{\"fromTime\":\"$from\",\"offset\":$offset,\"limit\":50}"; then
+  capped=""
+  while :; do   # 50 a page whatever is asked; `total` is always 0
+    if ! internal_get auditlog "$TMP/r-page.json" "{\"fromTime\":\"$from\",\"toTime\":\"$to\",\"offset\":$offset,\"limit\":50}"; then
       log "runs (beta) skipped: $ERR"; return
     fi
     jq -c '.items.items[]?' "$TMP/r-page.json" >> "$TMP/r-records.ndjson"
     n="$(jq '(.items.items // []) | length' "$TMP/r-page.json")"
-    [ "$n" -lt 50 ] && break
     offset=$(( offset + 50 ))
+    [ "$n" -lt 50 ] && break
+    if [ "$offset" -ge 50000 ]; then capped=1; break; fi   # 1,000 pages: past that the oldest day read is not whole
   done
+  if [ -n "$capped" ]; then
+    # the oldest day read is cut short: pushed whole, it would replace the map's complete
+    # count with a smaller one - so the window starts the day after it
+    cut="$(jq -s --argjson start "$start" '[ .[] | (.eventTimestamp // .startTime) | select(.) ] | (min // $start) | . - . % 86400000 + 86400000' "$TMP/r-records.ndjson")"
+    if [ "$cut" -gt "$now" ]; then log "runs (beta) skipped: more than 50000 runs in one day: no day of the window is complete"; return; fi
+    jq -c --argjson c "$cut" 'select((.eventTimestamp // .startTime // 0) >= $c)' "$TMP/r-records.ndjson" > "$TMP/r-kept.ndjson"
+    mv "$TMP/r-kept.ndjson" "$TMP/r-records.ndjson"
+    log "runs (beta): the audit log is longer than 50000 records; the window was shortened to start $(jq -rn --argjson c "$cut" '$c / 1000 | todate | .[0:10]')"
+    [ "$cut" -gt "$start" ] && start="$cut"
+  fi
   # per rule and UTC day: success, errors, nothing done, edits, time spent, runs per hour
   jq -s -c --argjson start "$start" '
     [ .[] | select(.ruleIdUuid) | (.eventTimestamp // .startTime) as $t | select($t and $t >= $start) | . + {t: $t} ] as $recs |
@@ -337,7 +383,7 @@ push_runs() {
   while read -r uuid id at; do
     [ "$budget" -le 0 ] && break
     budget=$(( budget - 1 ))
-    internal_get "auditlog/item/$id" "$TMP/r-item.json" 3 || continue
+    internal_get "auditlog/item/$id" "$TMP/r-item.json" || continue
     jq -c --arg u "$uuid" --argjson at "$at" '
       (.content.componentLogs // [])[] |
       ((.executionResult // {}) as $res |

@@ -1,6 +1,12 @@
 # The public automap-sync repository is a subtree of senders/ in the app repository.
-# On a tag v1.2.3: build the image for amd64 and arm64, push :1.2.3, :1.2 and :1 to GHCR,
-# sign it with cosign (keyless, GitHub OIDC) and attach an SBOM.
+# On a tag v*: build the image for amd64 and arm64 and push it to GHCR, signed with
+# cosign (keyless, GitHub OIDC) and with an SBOM attached.
+#
+# The image tags are the Python sender's VERSION (python/automap_sync.py), not the git
+# tag: the image runs that file, and `python/<version>` is what the receiver sees in
+# X-Automap-Sender. A tag made for the in-Jira senders (1.5.0 while Python is 1.3.0)
+# therefore rebuilds :1.3.0, :1.3 and :1 from the same file - the same image again.
+# Actions are pinned by commit; the base image by digest (docker/Dockerfile).
 name: release-image
 on:
   push:
@@ -13,29 +19,36 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: version
+        name: The Python sender's version is the image's
+        run: |
+          v="$(sed -n 's/^VERSION = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' python/automap_sync.py)"
+          test -n "$v" || { echo 'no VERSION = "x.y.z" in python/automap_sync.py'; exit 1; }
+          echo "tag ${GITHUB_REF_NAME}: the image is python/${v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
           images: ghcr.io/moy-apps/automap-sync
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}},value=v${{ steps.version.outputs.version }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          build-args: VERSION=${{ github.ref_name }}
+          build-args: VERSION=${{ steps.version.outputs.version }}
           sbom: true
           provenance: mode=max
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - run: cosign sign --yes ghcr.io/moy-apps/automap-sync@${{ steps.build.outputs.digest }}

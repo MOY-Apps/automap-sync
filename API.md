@@ -160,8 +160,11 @@ See [Answers](#answers). In short:
 - `500 failed`, or no answer at all: send the **same** chunk again, with a backoff. Resending
   a chunk replaces the copy already received, so it is always safe.
 - `409 conflict` or `422 checksum`: start again with a **new run id** from chunk 0. Do this
-  once; if it fails again, stop and report. A `409` on a *resent* last chunk of rules can mean
-  the first copy arrived: the push is done, and a new run would spend a second load.
+  once; if it fails again, stop and report. A `409` on a *resent* last chunk (one whose first
+  answer was lost, so you sent it again) means the first copy arrived and closed the run: the
+  push is done. Do not start a new run - it would load the same rules again and spend a
+  second load. Our senders do this from 1.3.0 (ScriptRunner and JMWE 1.5.0), for usage and
+  runs too.
 - `429`: stop and try later.
 - Anything else: stop and report. Sending the same request again will not help.
 
@@ -192,6 +195,12 @@ parts and builds once.
   it by the date: our senders use `d<YYYYMMDD>` in UTC, `d20261023`, stamped when the job
   starts. Schedule the copies inside the same UTC day - e.g. 01:00 and 02:00 UTC, not either
   side of 00:00 UTC - or they name different days and neither group completes.
+- How the rules are cut is the sender's business; the receiver merges whatever arrives. Cut
+  by something stable in each rule, not by its position in the list: our senders (1.5.0)
+  put a rule in part `(first 8 hex digits of its uuid, as a number) mod M + 1`, so a rule
+  made or deleted between the jobs moves no other rule across the cut. The slices are then
+  roughly, not exactly, equal. A slice by position shifts when the list shrinks, and a rule
+  near the boundary lands in no part that day.
 - `N/M` is the same on every chunk of the part; `M` is the same on every part. A part with
   another `M` is `409`.
 - The last chunk of a part is answered `202 accepted` while parts are missing, and
@@ -390,8 +399,10 @@ What each released version of our senders sends. The Docker image
 | 1.2.1 | scriptrunner, jmwe | as 1.2.0 on the wire; the usage job runs every hour over yesterday and today |
 | 1.3.0 | scriptrunner, jmwe | usage and runs in **chunks**, every rule (jmwe: chunks of 80,000 characters, proven by length) |
 | 1.4.0 | scriptrunner, jmwe | rules in parts (`PART=N/M`, `X-Automap-Part`), for sites past the host's time limit |
+| 1.3.0 | python, node, bash, powershell | as 1.2.0 on the wire to the receiver. A `409` to a resent last chunk ends the push instead of starting a second run; the audit log is read with `toTime` and, past 50,000 records, pushed from its first complete day; the internal API is retried honouring `Retry-After` |
+| 1.5.0 | scriptrunner, jmwe | as 1.4.0 on the wire to the receiver. Parts cut by each rule's own id (roughly equal slices); the resent-`409` rule above; JMWE retries every request (at once) and restarts once on `409`/`422` |
 
-Latest today: python, node, bash and powershell **1.2.0**; scriptrunner and jmwe **1.4.0**.
+Latest today: python, node, bash and powershell **1.3.0**; scriptrunner and jmwe **1.5.0**.
 The same list is in [`openapi.json`](openapi.json) under `x-automap-senders`.
 
 ### Old senders keep working

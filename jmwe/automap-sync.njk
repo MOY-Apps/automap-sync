@@ -20,10 +20,17 @@
   make two actions an hour apart with the same values except PART = "1/2" in the first
   and "2/2" in the second; each pushes its half, and the map is built when the last half
   of the day has arrived. Three are "1/3", "2/3", "3/3", up to 20. The limit is honest:
-  each copy must finish within JMWE's time limit; raise M until it does. The slices are
-  cut by rule id, so a rule made between the two actions may be missed until the next day.
-  The copies find each other by the UTC date they start on, so schedule them inside the
-  same UTC day - e.g. 01:00 and 02:00 UTC - never either side of 00:00 UTC.
+  each copy must finish within JMWE's time limit; raise M until it does. Each rule's part
+  is a function of its own id (its uuid's first 8 hex digits modulo M), so a rule made or
+  deleted between the actions moves no other rule across the cut; the slices are therefore
+  roughly, not exactly, equal. A rule made between the two actions may be missed until
+  the next day. The copies find each other by the UTC date they start on, so schedule
+  them inside the same UTC day - e.g. 01:00 and 02:00 UTC - never either side of 00:00 UTC.
+
+  Every request is tried up to three times when it gets no answer (a timeout), a 429 or
+  a 5xx - at once, since a template cannot wait. A 409 or 422 to the push starts it once
+  more under a new run id (a part: the same part again). A 409 to a last chunk sent again
+  means the receiver took the first copy and its answer was lost: the push is done.
 
   This is the first of two templates. automap-usage.njk, a Scheduled action of its own,
   pushes this month's usage and the audit log (beta, Advanced edition), so each gets a
@@ -41,10 +48,32 @@
 {%- set PART = "" -%}
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.4.0" -%}
+{%- set VERSION = "1.5.0" -%}
 {%- set CHUNK = 80000 -%}
 {%- set MAX_PAGES = 100 -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
+
+{#- callRest with up to three tries: no answer (a timeout gives _error and no _statusCode),
+    a 429 or a 5xx is tried again at once. The answer lands in `box` as [answer, tries - 1]:
+    a macro renders text, so it hands objects back through an array. `how` is "get" (with
+    the token), "post" (a JSON body, with the token) or "push" (text, with `opts` as given) -#}
+{%- macro fetch(box, url, how, body, opts) -%}
+{%- for tr in range(0, 3) -%}
+  {%- if tr < 3 and not box.length -%}
+    {%- if how == "push" -%}
+      {%- set r = url | callRest(verb="post", body=body, noJSON=true, dontFail=true, options=opts) -%}
+    {%- elif how == "post" -%}
+      {%- set r = url | callRest(verb="post", body=body, options=OPTS, dontFail=true) -%}
+    {%- else -%}
+      {%- set r = url | callRest(options=OPTS, dontFail=true) -%}
+    {%- endif -%}
+    {%- if not (r._error or r._statusCode) or (r._statusCode and r._statusCode != 429 and r._statusCode < 500) or tr == 2 -%}
+      {%- set _ = box.push(r) -%}
+      {%- set _ = box.push(tr) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
 
 {#- PART = "N/M", 1 <= N <= M <= 20, or ""; a bad value stops the action before it reads anything -#}
 {%- set pp = (PART | trim).split("/") if PART else [] -%}
@@ -76,39 +105,66 @@ automap-sync {{ NAME }} {{ VERSION }}: failed - [2] PART must be "N/M" with 1 <=
 automap-sync {{ NAME }} {{ VERSION }}: failed - [2] no clock (now): parts need the UTC date
 {%- else -%}
 
-{#- 1. the cloud id, then every rule id, page by page -#}
+{#- 1. the cloud id, then every rule id, page by page. A read the API refuses stops the
+    action with "[3]" and what was being read - never a rule's id -#}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
 {%- set API = "https://api.atlassian.com/automation/public/jira/" + tenant.cloudId + "/rest/v1" -%}
+{%- set stop = [] -%}
 {%- set ids = [] -%}
 {%- set pages = [""] -%}
 {%- for p in range(0, MAX_PAGES) -%}
-  {%- if p < pages.length -%}
+  {%- if p < pages.length and not stop.length -%}
     {#- links.next is a query string ("?cursor=...") on Atlassian's API, a full URL elsewhere -#}
     {%- set target = pages[p] if (pages[p] and pages[p].indexOf("http") == 0) else (API + "/rule/summary" + (pages[p] if pages[p] else "?limit=100")) -%}
-    {%- set page = target | callRest(options=OPTS) -%}
-    {%- for item in page.data -%}
-      {%- set _ = ids.push(item.uuid if item.uuid else item.id) -%}
-    {%- endfor -%}
-    {%- if page.links and page.links.next -%}
-      {%- set _ = pages.push(page.links.next) -%}
+    {%- set box = [] -%}
+    {%- set _ = fetch(box, target, "get") -%}
+    {%- set page = box[0] -%}
+    {%- if page._statusCode or page._error -%}
+      {%- set _ = stop.push("[3] the Automation API answered " + (page._statusCode if page._statusCode else "nothing") + " for the rule list") -%}
+    {%- else -%}
+      {%- for item in page.data -%}
+        {%- set _ = ids.push(item.uuid if item.uuid else item.id) -%}
+      {%- endfor -%}
+      {%- if page.links and page.links.next -%}
+        {%- set _ = pages.push(page.links.next) -%}
+      {%- endif -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
 
-{#- the slice: the ids in string order, cut into M equal pieces, so every copy of the action
-    cuts the list the same way whatever order the API listed it in -#}
+{#- the slice: a rule's part is a function of its own id - its first 8 hex digits as a
+    number, modulo M, plus 1 - so a rule made or deleted between the actions moves no other
+    rule across the cut, whatever order the API listed them in -#}
 {%- set total = ids.length -%}
 {%- if part -%}
   {%- set _ = ids.sort() -%}
-  {%- set per = (total + partM - 1) // partM -%}
-  {%- set ids = ids.slice((partN - 1) * per, partN * per) -%}
+  {%- set mine = [] -%}
+  {%- for id in ids -%}
+    {%- set v = [0] -%}
+    {%- for ci in range(0, 8) -%}
+      {%- if ci < 8 -%}
+        {%- set d = "0123456789abcdef".indexOf(("" + id).slice(ci, ci + 1) | lower) -%}
+        {%- if d >= 0 -%}{%- set _ = v.splice(0, 1, v[0] * 16 + d) -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if v[0] % partM + 1 == partN -%}{%- set _ = mine.push(id) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set ids = mine -%}
 {%- endif -%}
 
 {#- 2. each rule, wrapped in "rule", as compact JSON -#}
 {%- set parts = [] -%}
 {%- for id in ids -%}
-  {%- set d = (API + "/rule/" + id) | callRest(options=OPTS) -%}
-  {%- set _ = parts.push({ "rule": (d.rule if d.rule else d) } | dump) -%}
+  {%- if not stop.length -%}
+    {%- set box = [] -%}
+    {%- set _ = fetch(box, API + "/rule/" + id, "get") -%}
+    {%- set d = box[0] -%}
+    {%- if d._statusCode or d._error -%}
+      {%- set _ = stop.push("[3] the Automation API answered " + (d._statusCode if d._statusCode else "nothing") + " for rule " + loop.index + " of " + ids.length) -%}
+    {%- else -%}
+      {%- set _ = parts.push({ "rule": (d.rule if d.rule else d) } | dump) -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endfor -%}
 {%- set text = '{"rules":[' + parts.join(",") + '],"sender":{"name":"' + NAME + '","version":"' + VERSION + '","rules":' + parts.length + '}}' -%}
 
@@ -124,15 +180,21 @@ automap-sync {{ NAME }} {{ VERSION }}: failed - [2] no clock (now): parts need t
   {%- endif -%}
 {%- endfor -%}
 
-{#- 4. push: one run id (a part's is the day's, stamped above), chunks in order, the length on the last one -#}
-{%- set run = dayRun if part else (NAME + "-" + text.length + "-" + ids.length + "-" + nowMs) -%}
+{#- 4. push: one run id (a part's is the day's, stamped above), chunks in order, the length
+    on the last one. A 409 or 422 starts the push once more: a plain run under a new run id,
+    a part under the day's (sent again from chunk 0, it replaces itself). -#}
 {%- set failures = [] -%}
 {%- set queued = [] -%}
+{%- set taken = [] -%}
+{%- set again = [] -%}
 {%- set count = bounds.length - 1 -%}
+{%- for attempt in range(0, 2) -%}
+{%- if attempt < 2 and not stop.length and not failures.length and not taken.length and again.length == attempt -%}
+{%- set run = dayRun if part else (NAME + "-" + text.length + "-" + ids.length + "-" + nowMs + ("-r" if attempt else "")) -%}
 {#- JMWE's range() includes its end (checked live: range(0, 8) reached 8), the standard
     one does not; the guard makes both send exactly `count` chunks -#}
 {%- for i in range(0, count) -%}
-  {%- if failures.length == 0 and i < count -%}
+  {%- if failures.length == 0 and taken.length == 0 and again.length == attempt and i < count -%}
     {#- a map cannot be added to in Nunjucks, so each shape of the headers is written out:
         X-Automap-Part on every chunk of a part, Last and Length on the last chunk -#}
     {%- set headers = {
@@ -175,17 +237,29 @@ automap-sync {{ NAME }} {{ VERSION }}: failed - [2] no clock (now): parts need t
         "X-Automap-Length": "" + text.length
       } -%}
     {%- endif -%}
-    {%- set res = PUSH_URL | callRest(verb="post", body=text.slice(bounds[i], bounds[i + 1]), noJSON=true, dontFail=true, options={ "headers": headers, "timeout": 60000 }) -%}
-    {%- if res._statusCode -%}
-      {#- a part's run is the day's: 409 means the map was built today already, or the other
-          action has another M; 422 means this part's proof failed - run it again -#}
-      {%- set _ = failures.push("chunk " + i + ": HTTP " + res._statusCode
-          + (" (today's map is already built, or another copy of this action has a different M in PART)" if (part and res._statusCode == 409)
-          else (" (this part did not arrive whole; run the action again)" if (part and res._statusCode == 422) else ""))) -%}
+    {%- set box = [] -%}
+    {%- set _ = fetch(box, PUSH_URL, "push", text.slice(bounds[i], bounds[i + 1]), { "headers": headers, "timeout": 60000 }) -%}
+    {%- set res = box[0] -%}
+    {%- if res._statusCode == 409 and box[1] > 0 and i == count - 1 -%}
+      {#- the first copy of the last chunk was taken; its answer was lost on the way back.
+          A new run would load the same rules twice; a part sent again would change nothing -#}
+      {%- set _ = taken.push(1) -%}
+    {%- elif res._statusCode or res._error -%}
+      {%- if attempt == 0 and (res._statusCode == 422 or (res._statusCode == 409 and not part)) -%}
+        {%- set _ = again.push(1) -%}
+      {%- else -%}
+        {#- a part's run is the day's: 409 means the map was built today already, or the other
+            action has another M; 422 means this part's proof failed twice - run it again -#}
+        {%- set _ = failures.push("chunk " + i + ": " + (("HTTP " + res._statusCode) if res._statusCode else "no answer")
+            + (" (today's map is already built, or another copy of this action has a different M in PART)" if (part and res._statusCode == 409)
+            else (" (this part did not arrive whole; run the action again)" if (part and res._statusCode == 422) else ""))) -%}
+      {%- endif -%}
     {%- elif i == count - 1 and ("" + res).indexOf('"queued":true') >= 0 -%}
       {%- set _ = queued.push(1) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-automap-sync {{ NAME }} {{ VERSION }}: {{ ("part " + part + ": " + ids.length + " of " + total + " rules, ") if part else (ids.length + " rules, ") }}{{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + failures.join("; ")) if failures.length else (("part " + part + ": " + ids.length + " rules pushed, " + ("map queued" if queued.length else ("waiting for the other " + ("part" if partM == 2 else "parts")))) if part else "pushed, the map is rebuilding") }}
+{%- endif -%}
+{%- endfor -%}
+automap-sync {{ NAME }} {{ VERSION }}: {{ ("part " + part + ": " + ids.length + " of " + total + " rules, ") if part else (ids.length + " rules, ") }}{{ text.length }} characters in {{ count }} chunk(s): {{ ("failed - " + stop[0]) if stop.length else (("failed - " + failures.join("; ")) if failures.length else (("part " + part + ": " + ids.length + " rules " + (("already taken (the answer to the last chunk was lost)") if taken.length else ("pushed, " + ("map queued" if queued.length else ("waiting for the other " + ("part" if partM == 2 else "parts")))))) if part else (("the last chunk was already taken; " if taken.length else "") + "pushed, the map is rebuilding"))) }}
 {%- endif -%}

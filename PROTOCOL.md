@@ -149,7 +149,11 @@ X-Automap-Length: <length>                   (final chunk, for senders that cann
   (`400 bad-request`).
 - **Strictly in order, one at a time.** Chunk *n* is refused (`409 conflict`) unless chunks
   0…*n*-1 of the same run are already in. Resending a chunk already received replaces it,
-  so a chunk whose answer was lost can simply be sent again.
+  so a chunk whose answer was lost can simply be sent again - except the last one: once it
+  was taken the run is closed, and the resend is `409`. A sender that gets `409` to a
+  chunk it is *resending* that carries `X-Automap-Last` therefore treats the push as done
+  (our senders from 1.3.0, ScriptRunner and JMWE 1.5.0, usage and runs included); a new run
+  would load the same rules twice and spend a second load.
 - **Chunk 0 starts (or restarts) the run**: it clears whatever that run had staged. It is
   also where the plan's load allowance is checked.
 - **Proving the payload without a hash.** A sender with no SHA-256 (JMWE's Nunjucks) sends
@@ -182,6 +186,12 @@ document the build reads, and builds once.
   before the minutes of reading. So schedule the copies inside the same UTC day - e.g.
   01:00 and 02:00 UTC, not either side of 00:00 UTC - or they name different days and
   neither group completes. The receiver asks only that it is a run id.
+- **The cut is the sender's.** The receiver merges whatever arrives. Our senders (1.5.0)
+  put a rule in part `(its uuid's first 8 hex digits as a number) mod M + 1`: a function of
+  the rule alone, so a rule made or deleted between the jobs moves no other rule across
+  the cut, and the slices are roughly, not exactly, equal. 1.4.0 cut the sorted list by
+  position, and a deletion between the jobs could leave a rule near the boundary in
+  neither part that day (APPS-515).
 - **Staged apart, built together.** Part N is staged under `push-<run>-p<N>`; chunk 0 of a
   part clears that part - a resent part replaces itself. The group's `builds` row,
   `push-<run>`, is opened by whichever part's chunk 0 comes first, and the load allowance is
@@ -232,7 +242,7 @@ Atlassian). Read the **status code**; the `error` word separates the two 429s.
 | 402 | `inactive` — the subscription on this site has ended | stop |
 | 403 | `disabled` — this installation does not take pushes: switched off, or the site is on Basic, where the map loads from an export file only (remembered as `plan` on the settings page) | stop |
 | 404 / 405 | `not-found` / `method` | wrong URL or verb |
-| 409 | `conflict` — out of order, unknown run, run already closed, `Last` sent early | start a **new run** from chunk 0 |
+| 409 | `conflict` — out of order, unknown run, run already closed, `Last` sent early | start a **new run** from chunk 0 - unless it answers a *resent* last chunk: then the first copy closed the run and the push is done |
 | 413 | `too-large` — chunk over 256 KiB | send smaller chunks |
 | 426 | `upgrade` — this sender version is below the minimum | update the image or the script; exit 4 |
 | 422 | `checksum` — the joined chunks do not match the SHA-256 or the length; the build is marked failed, nothing loaded, the previous map stays | start a new run; if it repeats, check for line breaks or a body altered in transit |
@@ -341,6 +351,17 @@ reads at most `RUNS_MAX_PAGES` (60) pages of the audit log, proves each push by
 `X-Automap-Length` as it does the rules, and sends usage and runs in chunks of 80 000
 characters, every rule included.
 
+The audit log is newest first and paged by `offset`, so runs landing while a sender pages
+would shift every page - duplicates and gaps. From 1.3.0 (ScriptRunner and JMWE 1.5.0) a
+sender sends `toTime` = the instant it stamped as `window.end` (ISO 8601 with milliseconds
+and `Z`, [automation-audit-log-api.md](automation-audit-log-api.md)) with `fromTime` =
+`window.start` on every page, and retries a 429 (honouring `Retry-After`), a 5xx or no
+answer from the internal API three times with the Automation API's backoff. Python, Node,
+bash and PowerShell read at most 50,000 records (1,000 pages); hitting that, the oldest
+day read is not whole, so its rows are dropped, `window.start` moves to the first complete
+day and the log says the window was shortened - pushed whole, a partial day would replace
+the map's complete count with a smaller one (`writeRuns` replaces the days a window covers).
+
 What travels is counts and codes, nothing else: per rule and UTC day how many runs
 succeeded, failed, did nothing (`NO_ACTIONS_PERFORMED`) or were edits (`CONFIG_CHANGE`),
 the time spent; and for the rules that failed, up to two of their newest failed runs read in
@@ -378,7 +399,10 @@ the ones that mostly do nothing, and the site's runs per month.
 ## 6c. Old senders keep working
 
 A job is pasted once and runs for years, so every sender version ever released keeps
-working against every later receiver. The minimum in `src/push/senders.js` stays `1.0.0`
+working against every later receiver. Released: python, node, bash, powershell 1.0.0,
+1.1.0, 1.2.0, 1.3.0; scriptrunner 1.0.0, 1.0.1, 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.5.0;
+jmwe 1.0.0, 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.5.0 (the matrix in
+[`API.md`](API.md) says what each sends). The minimum in `src/push/senders.js` stays `1.0.0`
 for every sender. The receiver keeps taking every shape a released sender has sent: rules in
 one chunk or many, proven by SHA-256 or by length; usage and runs in one chunk (1.1) or in
 many (1.2+). A new feature may ask for a newer sender to *use* it; it never stops an older

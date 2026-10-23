@@ -7,7 +7,9 @@ import { createHash } from 'node:crypto';
  * the receiver's contract in docs/push-sync.md closely enough that a sender passing here
  * passes against the real one - ordered chunks, the checksum on the last, the status
  * codes - and it misbehaves on purpose where real life does: a 429 on the second page of
- * summaries, a 500 on the second chunk of the first run.
+ * summaries, a 500 on the second chunk of the first run, the answer to a last chunk lost
+ * after the receiver took it, a 500 and a 429 with Retry-After on the internal API, an
+ * audit log that grows while it is being paged, and one too long to read whole.
  */
 
 export const CLOUD_ID = '33333333-3333-4333-8333-333333333333';
@@ -55,18 +57,12 @@ const ANSWERS = {
 };
 
 /**
- * @param rules        what the API holds
- * @param pageSize     summaries per page (small, so paging is exercised)
- * @param refuse       answer every push with this output instead (e.g. 'allowance')
- * @param flaky        whether to fail once: page 2 with 429, chunk 1 of run 1 with 500
- * @param host         the name the sender should use for this server
- */
-/**
  * The internal API behind Jira's Usage tab (docs/automation-usage-api.md), as observed:
  * the first two rules spent steps this month, nobody spent Rovo credits. `usage: 'broken'`
  * answers 500 everywhere, as it will the day Atlassian changes it.
  */
 function usageAnswer(name, url, rules) {
+  if (name === 'auditlog') return null;   // answered by auditLog() below
   const [a, b] = rules;
   const flows = [
     { ruleUuid: a.uuid, ruleName: a.name, state: 'ENABLED', runs: 14, automationCredits: 1303, rovoCredits: 0,
@@ -89,17 +85,6 @@ function usageAnswer(name, url, rules) {
       return { data: [{ month: '2026-09', workspaceCounts: { JIRA_SERVICE_MANAGEMENT: 1073 } }] };
     case 'hasCreditPack':
       return { hasCreditPack: false };
-    case 'auditlog': {
-      // the audit log: two runs of the first rule (one failed), one idle run of the second, an edit
-      const now = Date.now();
-      const items = [
-        { id: 101, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SOME_ERRORS', eventTimestamp: now - 3600000, durationMs: 31000, associatedIds: ['10042'] },
-        { id: 102, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SUCCESS', eventTimestamp: now - 7200000, durationMs: 29000 },
-        { id: 103, ruleIdUuid: b.uuid, ruleName: b.name, category: 'NO_ACTIONS_PERFORMED', eventTimestamp: now - 3600000, durationMs: 120 },
-        { id: 104, ruleIdUuid: b.uuid, ruleName: b.name, category: 'CONFIG_CHANGE', eventTimestamp: now - 3600000 },
-      ];
-      return { items: { items: url.searchParams.get('offset') ? [] : items, total: 0 } };
-    }
     case 'auditlog/item/101':
       return { id: 101, content: { componentLogs: [
         { component: { id: 'c-trigger', componentType: 'TRIGGER', type: 'jira.jql.scheduled' }, changes: [], executionResult: { state: null } },
@@ -112,7 +97,73 @@ function usageAnswer(name, url, rules) {
   }
 }
 
-export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null, flaky = true, host = '127.0.0.1', usage = true } = {}) {
+/**
+ * The audit log behind `POST auditlog`, newest first, 50 a page whatever `limit` asks,
+ * `total` always 0 (docs/automation-audit-log-api.md). By default the four records of a
+ * small site: two runs of the first rule (one failed), one idle run of the second, an edit.
+ * With `audit: { size }` it is `size` successful runs of the first two rules, one every
+ * five seconds back from two seconds ago; with `grow`, every page read lands `grow` newer runs at the
+ * head, as a busy site does while a sender pages - so a sender that does not send
+ * `toTime` sees shifted pages. `fromTime` and `toTime` (ISO 8601 with milliseconds and Z)
+ * are honoured; a malformed `toTime` is a 400.
+ */
+function auditLog(rules, audit, state) {
+  const [a, b] = rules;
+  const now = Date.now();
+  const records = [];
+  if (audit && audit.size) {
+    // the newest two seconds back: a sender's clock may stamp whole seconds (bash)
+    for (let i = 0; i < audit.size; i += 1) {
+      const r = i % 2 ? b : a;
+      records.push({ id: 1000 + i, ruleIdUuid: r.uuid, ruleName: r.name, category: 'SUCCESS', eventTimestamp: now - 2000 - 5000 * i, durationMs: 100 });
+    }
+  } else {
+    records.push(
+      { id: 101, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SOME_ERRORS', eventTimestamp: now - 3600000, durationMs: 31000, associatedIds: ['10042'] },
+      { id: 102, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SUCCESS', eventTimestamp: now - 7200000, durationMs: 29000 },
+      { id: 103, ruleIdUuid: b.uuid, ruleName: b.name, category: 'NO_ACTIONS_PERFORMED', eventTimestamp: now - 3600000, durationMs: 120 },
+      { id: 104, ruleIdUuid: b.uuid, ruleName: b.name, category: 'CONFIG_CHANGE', eventTimestamp: now - 3600000 },
+    );
+  }
+  state.audit = { records, calls: [] };
+  let grown = 0;
+  const ISO_MS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  return (body) => {
+    const { fromTime, toTime, offset = 0 } = body;
+    state.audit.calls.push({ fromTime, toTime, offset });
+    if (toTime !== undefined && !ISO_MS.test(String(toTime))) return [400, { errorMessages: ['toTime must be ISO 8601 with milliseconds'] }];
+    if (fromTime !== undefined && !ISO_MS.test(String(fromTime))) return [400, { errorMessages: ['fromTime must be ISO 8601 with milliseconds'] }];
+    if (audit && audit.grow) {
+      // runs that happened since the sender stamped its window: a minute after the first read, so they are newer whatever the clock does
+      const since = state.audit.calls[0].at || (state.audit.calls[0].at = Date.now() + 60000);
+      for (let i = 0; i < audit.grow; i += 1) {
+        grown += 1;
+        records.unshift({ id: 90000 + grown, ruleIdUuid: a.uuid, ruleName: a.name, category: 'SUCCESS', eventTimestamp: since + grown, durationMs: 50 });
+      }
+    }
+    const from = fromTime ? Date.parse(fromTime) : -Infinity;
+    const to = toTime ? Date.parse(toTime) : Infinity;
+    const inWindow = records.filter((r) => r.eventTimestamp >= from && r.eventTimestamp <= to);
+    return [200, { items: { items: inWindow.slice(offset, offset + 50), total: 0 } }];
+  };
+}
+
+/**
+ * @param rules        what the API holds (read live: a rule removed from the array is gone)
+ * @param pageSize     summaries per page (small, so paging is exercised)
+ * @param refuse       answer every push with this output instead (e.g. 'allowance')
+ * @param flaky        whether to fail once: page 2 with 429, chunk 1 of run 1 with 500
+ * @param host         the name the sender should use for this server
+ * @param usage        'broken': the internal API answers 500 everywhere
+ * @param internalFlaky once each: creditUsage 500, auditlog 429 with Retry-After, auditlog/item/101 500
+ * @param lose         'rules' | 'usage' | 'runs': the answer to the last chunk of the first push of
+ *                     that kind is lost - the receiver takes the chunk, the sender hears nothing
+ * @param audit        { size, grow }: the audit log's shape, see auditLog()
+ * @param missing      the uuid of a rule whose detail answers 404 (listed, not readable)
+ * @param garbage      the rule list answers 200 with a body that is not JSON
+ */
+export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null, flaky = true, host = '127.0.0.1', usage = true,
+  internalFlaky = false, lose = null, audit = null, missing = null, garbage = false } = {}) {
   const state = {
     // the usage and runs pushes (beta), apart from the rules: `runs` below is the rule runs' staging
     pushed: { usage: [], runs: [] },
@@ -124,11 +175,16 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
     senders: new Set(),
     nonAscii: false,
     pushRequests: 0,
+    lost: 0,
+    internalTrips: [],
   };
   let tripped429 = false;
   let tripped500 = false;
-  const byId = new Map(rules.map((r) => [r.uuid, r]));
+  let lostOnce = false;
+  const tripped = new Set();
+  const byId = (id) => rules.find((r) => r.uuid === id);
   const basic = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString('base64')}`;
+  const auditAnswer = auditLog(rules, audit, state);
 
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -145,13 +201,24 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
         state.usageCalls += 1;
         if (req.headers.authorization !== basic) return json(res, 403, {});
         if (usage === 'broken') return json(res, 500, { errorMessages: ['gone'] });
-        let ask = url;
-        if (req.method === 'POST' && raw.length) {
-          // the audit log list is a POST with its paging in the body
-          const b = JSON.parse(raw.toString('utf8'));
-          ask = new URL(`http://x/?offset=${b.offset ? b.offset : ''}`);
+        const name = p.slice(internal.length);
+        const trip = (what, status, headers) => {
+          if (!internalFlaky || tripped.has(what)) return false;
+          tripped.add(what);
+          state.internalTrips.push(what);
+          json(res, status, { errorMessages: ['flaky'] }, headers);
+          return true;
+        };
+        if (name === 'creditUsage' && trip('creditUsage', 500)) return undefined;
+        if (name === 'auditlog/item/101' && trip('auditlog/item/101', 500)) return undefined;
+        if (name === 'auditlog') {
+          if (req.method !== 'POST') return json(res, 405, {});
+          if (trip('auditlog', 429, { 'Retry-After': '1', 'x-ratelimit-limit': '500', 'x-ratelimit-remaining': '0' })) return undefined;
+          // the audit log list is a POST with its paging and window in the body
+          const [status, body] = auditAnswer(raw.length ? JSON.parse(raw.toString('utf8')) : {});
+          return json(res, status, body);
         }
-        const body = usageAnswer(p.slice(internal.length), ask, rules);
+        const body = usageAnswer(name, url, rules);
         return body === null ? json(res, 404, {}) : json(res, 200, body);
       }
 
@@ -166,6 +233,10 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
             tripped429 = true;
             return json(res, 429, { message: 'slow down' }, { 'Retry-After': '1' });
           }
+          if (garbage) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end('<html>not json</html>');
+          }
           const size = Math.min(limit, pageSize);
           const page = rules.slice(cursor, cursor + size);
           const next = cursor + size < rules.length
@@ -178,8 +249,9 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
           });
         }
         const m = p.match(/\/rule\/([^/]+)$/);
-        if (m && byId.has(decodeURIComponent(m[1]))) {
-          const r = byId.get(decodeURIComponent(m[1]));
+        if (m && missing && decodeURIComponent(m[1]) === missing) return json(res, 404, { message: 'no such rule' });
+        if (m && byId(decodeURIComponent(m[1]))) {
+          const r = byId(decodeURIComponent(m[1]));
           // the detail comes back bare or wrapped, and the sender must wrap it either way
           return json(res, 200, r.state === 'DISABLED' ? r : { rule: r });
         }
@@ -189,12 +261,19 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
       if (p === '/push/v1' && req.method === 'GET') return json(res, 200, { ok: true, receiver: 'fake' });
       if (p !== '/push/v1/push') return json(res, 404, { error: 'not-found' });
       state.pushRequests += 1;
+      const h = (name) => req.headers[name.toLowerCase()];
+      const kindOf = () => (h('x-automap-kind') === 'usage' || h('x-automap-kind') === 'runs' ? h('x-automap-kind') : 'rules');
       const answer = (key) => {
         state.answers.push(key);
+        // the answer to this last chunk is lost: everything above happened, the sender hears nothing
+        if (lose && !lostOnce && lose === kindOf() && (h('x-automap-last') === '1' || h('x-automap-last') === 'true') && (key === 'queued' || key === 'accepted')) {
+          lostOnce = true;
+          state.lost += 1;
+          return req.socket.destroy();
+        }
         const [status, body] = ANSWERS[key];
         return json(res, status, body);
       };
-      const h = (name) => req.headers[name.toLowerCase()];
       const given = h('x-automap-key') || String(h('authorization') || '').replace(/^Bearer\s+/i, '');
       if (given !== KEY) return answer('unauthorized');
       if (refuse) return answer(refuse);

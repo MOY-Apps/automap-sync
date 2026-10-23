@@ -31,6 +31,11 @@ Usage:  python3 automap_sync.py [--dry-run]
 Exit codes: 0 pushed (or dry run), 2 configuration, 3 Atlassian API, 4 refused by the
 receiver (fix something, do not retry), 5 try later (allowance or rate limit), 6 failed.
 
+From 1.3.0: a 409 to a last chunk sent again (its first answer lost) means the receiver
+took the first copy - the push is done, no second run; the audit log is read up to the
+instant the window ends (toTime) and, cut at 50,000 records, pushed from its first complete
+day; the internal API is retried like the Automation API, honouring Retry-After.
+
 Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
 """
 import base64
@@ -47,7 +52,7 @@ import urllib.request
 import uuid
 
 NAME = "python"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 UA = f"automap-sync-{NAME}/{VERSION}"
 
 EXIT_CONFIG, EXIT_ATLASSIAN, EXIT_REFUSED, EXIT_LATER, EXIT_FAILED = 2, 3, 4, 5, 6
@@ -81,6 +86,21 @@ def request(method, url, headers=None, body=None, timeout=60):
         return err.code, err.headers, err.read()
 
 
+def pause(headers, wait):
+    """Sleep Retry-After seconds when given, else `wait` with jitter; the next wait (doubling to 15 s)."""
+    retry_after = headers.get("Retry-After") if headers else None
+    time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else wait + random.random() / 2)
+    return min(wait * 2, 15)
+
+
+def parse(body, what):
+    """The JSON of a 200, or a Stop: a proxy's HTML page is an Atlassian-side failure, not a crash."""
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise Stop(EXIT_ATLASSIAN, f"the Automation API answered 200 with a body that is not JSON for {what}")
+
+
 class Atlassian:
     def __init__(self):
         self.email = env("ATLASSIAN_EMAIL")
@@ -96,10 +116,11 @@ class Atlassian:
         status, _, body = request("GET", site.rstrip("/") + "/_edge/tenant_info")
         if status != 200:
             raise Stop(EXIT_ATLASSIAN, f"could not read the cloud id of {site} (HTTP {status})")
-        return json.loads(body)["cloudId"]
+        return parse(body, "the cloud id").get("cloudId")
 
-    def get(self, path):
-        """GET with retries on 429/5xx and network trouble; the decoded JSON."""
+    def get(self, path, what):
+        """GET with retries on 429/5xx and network trouble; the decoded JSON. `what` names the
+        read in the log ("the rule list", "rule 3 of 40"): never the rule's id."""
         wait = 1.0
         for attempt in range(1, 6):
             try:
@@ -108,7 +129,7 @@ class Atlassian:
             except OSError as err:
                 status, headers, body = None, {}, str(err).encode()
             if status == 200:
-                return json.loads(body)
+                return parse(body, what)
             if status == 401:
                 raise Stop(EXIT_ATLASSIAN, "the Automation API rejected the token (401): it must be an API "
                                            "token with the Automation scope, for this e-mail")
@@ -116,12 +137,10 @@ class Atlassian:
                 raise Stop(EXIT_ATLASSIAN, "the Automation API refused access (403): the account must be a "
                                            "Jira administrator")
             if (status is None or status == 429 or status >= 500) and attempt < 5:
-                retry_after = headers.get("Retry-After") if headers else None
-                time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else wait + random.random() / 2)
-                wait = min(wait * 2, 15)
+                wait = pause(headers, wait)
                 continue
-            raise Stop(EXIT_ATLASSIAN, f"the Automation API answered {status} for {path.split('?')[0]}")
-        raise Stop(EXIT_ATLASSIAN, "gave up on the Automation API")
+            raise Stop(EXIT_ATLASSIAN, f"the Automation API answered {status} for {what}")
+        raise Stop(EXIT_ATLASSIAN, f"gave up on the Automation API reading {what}")
 
     def rules(self):
         ids, seen, cursor, pages = [], set(), None, 0
@@ -129,7 +148,7 @@ class Atlassian:
             params = {"limit": "100"}
             if cursor:
                 params["cursor"] = cursor
-            page = self.get("/rule/summary?" + urllib.parse.urlencode(params))
+            page = self.get("/rule/summary?" + urllib.parse.urlencode(params), "the rule list")
             pages += 1
             for item in page.get("data") or []:
                 rid = item.get("id") or item.get("uuid")
@@ -142,29 +161,52 @@ class Atlassian:
                 break
         log(f"{len(ids)} rules listed in {pages} page(s)")
         out = []
-        for rid in ids:
-            detail = self.get("/rule/" + urllib.parse.quote(str(rid), safe=""))
+        for i, rid in enumerate(ids):
+            detail = self.get("/rule/" + urllib.parse.quote(str(rid), safe=""), f"rule {i + 1} of {len(ids)}")
             out.append({"rule": detail.get("rule", detail) if isinstance(detail, dict) else detail})
         return out
 
 
-class Usage:
+class Internal:
+    """The internal API behind Jira's Usage and Audit log tabs (BETA, undocumented). A 429
+    (Retry-After honoured), a 5xx or no answer is tried three times with the Automation
+    API's backoff; anything else is a ValueError, which the callers turn into "skipped"."""
+
+    def __init__(self, atlassian):
+        self.a = atlassian
+        self.base = f"{atlassian.api}/automation/internal-api/jira/{atlassian.cloud}/pro/rest/GLOBAL/"
+
+    def call(self, path, body=None):
+        headers = {"Authorization": self.a.auth, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        wait = 1.0
+        for attempt in range(1, 4):
+            try:
+                status, answered, raw = request("POST" if body is not None else "GET", self.base + path, headers, data)
+            except OSError:
+                status, answered, raw = None, {}, b""
+            if status == 200:
+                return json.loads(raw)
+            if (status is None or status == 429 or status >= 500) and attempt < 3:
+                wait = pause(answered, wait)
+                continue
+            break
+        raise ValueError(f"{path.split('?')[0]} answered {status}")
+
+    def get(self, path):
+        return self.call(path)
+
+
+class Usage(Internal):
     """Automation usage (BETA) from the internal API behind Jira's Usage tab.
 
     Undocumented: every failure here is a reason to skip usage, never to fail the run.
     Mapped to the receiver's own shape (docs/push-sync.md, "Usage"), so a change on
     Atlassian's side is fixed in the senders. Account ids are not copied.
     """
-
-    def __init__(self, atlassian):
-        self.a = atlassian
-        self.base = f"{atlassian.api}/automation/internal-api/jira/{atlassian.cloud}/pro/rest/GLOBAL/"
-
-    def get(self, path):
-        status, _, body = request("GET", self.base + path, {"Authorization": self.a.auth, "Accept": "application/json"})
-        if status != 200:
-            raise ValueError(f"{path.split('?')[0]} answered {status}")
-        return json.loads(body)
 
     def flows(self, start, end):
         by_rule = {}
@@ -228,48 +270,47 @@ class Usage:
         return out
 
 
-class Runs:
+class Runs(Internal):
     """The audit log (BETA), folded into what the map needs. Undocumented, like Usage."""
 
     MAX_DETAILS = 40          # one request per failed run read in full; two per rule at most
-
-    def __init__(self, atlassian):
-        self.a = atlassian
-        self.base = f"{atlassian.api}/automation/internal-api/jira/{atlassian.cloud}/pro/rest/GLOBAL/"
-
-    def call(self, path, body=None):
-        headers = {"Authorization": self.a.auth, "Accept": "application/json"}
-        data = None
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-            data = json.dumps(body).encode()
-        for attempt in range(1, 4):
-            try:
-                status, _, raw = request("POST" if body is not None else "GET", self.base + path, headers, data)
-            except OSError:
-                status, raw = None, b""
-            if status == 200:
-                return json.loads(raw)
-            if status not in (None, 429) and status < 500:
-                break
-            time.sleep(2 * attempt)
-        raise ValueError(f"{path.split('?')[0]} answered {status}")
+    MAX_RECORDS = 50000       # 1,000 pages; past that the oldest day read is not whole
 
     @staticmethod
     def day(ms):
         return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))
 
+    @staticmethod
+    def iso(ms):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + f".{ms % 1000:03d}Z"
+
     def read(self, days, now_ms):
         start = now_ms - days * 86400000
         start -= start % 86400000          # whole days, so a day pushed is a day complete
-        records, offset = [], 0
-        while offset < 50000:              # 50 a page whatever is asked; `total` is always 0
-            page = (self.call("auditlog", {"fromTime": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(start / 1000)),
-                                           "offset": offset, "limit": 50}).get("items") or {}).get("items") or []
+        # the log is newest first and paged by offset: runs landing while it is read would
+        # shift every page, so the read ends at the instant the window does (toTime)
+        window = {"fromTime": self.iso(start), "toTime": self.iso(now_ms)}
+        records, offset, capped = [], 0, False
+        while True:                        # 50 a page whatever is asked; `total` is always 0
+            page = (self.call("auditlog", {**window, "offset": offset, "limit": 50}).get("items") or {}).get("items") or []
             records += page
+            offset += 50
             if len(page) < 50:
                 break
-            offset += 50
+            if offset >= self.MAX_RECORDS:
+                capped = True
+                break
+        if capped:
+            # the oldest day read is cut short: pushed whole, it would replace the map's
+            # complete count with a smaller one - so the window starts the day after it
+            stamps = [r.get("eventTimestamp") or r.get("startTime") for r in records]
+            oldest = min(t for t in stamps if t) if any(stamps) else start
+            cut = oldest - oldest % 86400000 + 86400000
+            if cut > now_ms:
+                raise ValueError(f"more than {self.MAX_RECORDS} runs in one day: no day of the window is complete")
+            records = [r for r in records if (r.get("eventTimestamp") or r.get("startTime") or 0) >= cut]
+            log(f"runs (beta): the audit log is longer than {self.MAX_RECORDS} records; the window was shortened to start {self.day(cut)}")
+            start = max(start, cut)
         rows = {}
         failed = {}
         for r in records:
@@ -345,6 +386,11 @@ def push_kind(kind, payload):
             if status in (202,) or (status is not None and status < 500 and status != 429) or tries == 3:
                 break
             time.sleep(2 ** tries)
+        if status == 409 and tries > 1 and seq == len(chunks) - 1:
+            # the first copy of the last chunk was taken and closed the run; its answer was
+            # lost on the way back. Nothing to send again: the push is done.
+            log(f"{kind} (beta): the last chunk was already taken; the push went through")
+            status, body = 202, b'{"accepted":true,"queued":true}'
         if status != 202:
             break
     return status, body
@@ -430,6 +476,11 @@ def push(payload, dry_run):
             word = _word(body)
             if status == 202:
                 continue
+            if status == 409 and tries > 1 and seq == len(chunks) - 1:
+                # the first copy of the last chunk was taken and closed the run; its answer
+                # was lost on the way back. A new run would load the same rules twice.
+                log(f"the last chunk was already taken: pushed {len(data)} bytes in {len(chunks)} chunk(s); the map is rebuilding")
+                return
             if status in (409, 422) and attempt == 1:
                 log(f"receiver answered {status} {word}; starting the push again")
                 restart = True

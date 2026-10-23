@@ -57,7 +57,16 @@ function callRest(url, kw = {}) {
   }
   for (const [k, v] of Object.entries(opts.headers || {})) args.push('-H', `${k}: ${v}`);
   args.push(rewrite(url));
-  const out = execFileSync('curl', args, { input: input === undefined ? '' : Buffer.from(input, 'utf8'), maxBuffer: 64 * 1024 * 1024 }).toString('utf8');
+  let out;
+  try {
+    out = execFileSync('curl', args, { input: input === undefined ? '' : Buffer.from(input, 'utf8'), maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'ignore'] }).toString('utf8');
+  } catch (err) {
+    // no answer (a timeout, a dropped connection): JMWE's callRest with dontFail gives
+    // `_error` and no `_statusCode`; without dontFail the post-function fails
+    calls.push({ verb, url, status: 0, bodyChars: input === undefined ? 0 : input.length, headers: opts.headers || {} });
+    if (kw.dontFail) return { _error: { code: 'ECONNRESET', description: `curl exited ${err.status}` } };
+    throw new Error(`callRest ${verb} ${url}: no answer`);
+  }
   const cut = out.lastIndexOf('\n');
   const status = Number(out.slice(cut + 1));
   const text = out.slice(0, cut);

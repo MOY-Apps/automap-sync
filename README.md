@@ -33,7 +33,7 @@ All of them read the same settings, send the same thing and exit the same way.
 | `AUTOMAP_URL` | Jira settings → Apps → Automation Map → Data → *Push from your side* → **Set up**: the guide shows the receiver URL |
 | `AUTOMAP_KEY` | the same guide makes it the moment a tool is picked, and shows it once |
 | `AUTOMAP_CHUNK_BYTES` | optional, default `200000` |
-| `PART` | ScriptRunner and JMWE only (1.4.0), optional: `1/2` and `2/2` on two scheduled copies of the rules job, each pushing its slice; for a site past the host's time limit. Empty = all in one |
+| `PART` | ScriptRunner and JMWE only (1.4.0), optional: `1/2` and `2/2` on two scheduled copies of the rules job, each pushing its slice; for a site past the host's time limit. Empty = all in one. A rule's slice follows from its own id (1.5.0), so the slices are roughly, not exactly, equal |
 
 `--dry-run` (PowerShell: `-DryRun`; ScriptRunner: `AUTOMAP_DRY_RUN=1`) reads everything and
 pushes nothing — a safe first test of the Atlassian side.
@@ -50,7 +50,12 @@ separate push:
   error's code for the rules that failed. No issue ids, no message text, no account ids.
 
 From 1.2.0 (ScriptRunner and JMWE 1.3.0) both go in chunks like the rules, so a large site
-sends every rule, not only the busiest.
+sends every rule, not only the busiest. From 1.3.0 (ScriptRunner and JMWE 1.5.0) the audit
+log is read up to the instant the sender started, so runs landing while it reads shift no
+page, and the internal API is retried on 429 and 5xx like the Automation API. Python,
+Node.js, bash and PowerShell read at most 50,000 audit records (1,000 pages); past that
+the oldest day read is not whole, so it is dropped and the window shortened - the log says
+so, and `AUTOMAP_RUNS_DAYS` lower keeps the window whole.
 
 Both read an internal Atlassian API that is not documented and can change. If either
 fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=off` and
@@ -72,7 +77,10 @@ and the usage job runs every hour: each run is short, and the map keeps 35 days 
 | 5 | try later: the plan's load allowance is used up, or too many requests | run less often |
 | 6 | failed after retries | run again; if it repeats, contact us with the log |
 
-The log has counts and status words only — never a token, a key or a rule.
+The log has counts and status words only — never a token, a key or a rule. A sender that
+sent its last chunk and never heard back sends it again; a `409` to that resend means the
+receiver took the first copy, and the sender exits 0 saying so (from 1.3.0, ScriptRunner
+and JMWE 1.5.0) rather than loading the day's rules a second time.
 
 ## Schedule
 
@@ -93,7 +101,9 @@ gets exit 5.
 
 - The image tag `:1` always points at the newest compatible release; `--pull always` (or
   `imagePullPolicy: Always`) picks it up on the next run. Pin `:1.3.0` or a digest if you
-  update through Renovate/Dependabot instead.
+  update through Renovate/Dependabot instead. The image's tags are the **Python sender's
+  version** inside it - what the receiver sees as `python/1.3.0` - not the repository's
+  tag, which also counts the in-Jira senders (1.5.0).
 - Every sender sends its version (`X-Automap-Sender: python/1.2.0`). The settings card
   says when a newer one is out. If a version is ever too old for the protocol, the
   receiver answers `426 upgrade` and the sender exits 4 with a message saying so — a

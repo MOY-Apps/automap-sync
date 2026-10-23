@@ -18,6 +18,12 @@
   RUNS_MAX_PAGES pages of 50, the runs are left out rather than sent in part - set
   RUNS_DAYS lower.
 
+  Every request is tried up to three times when it gets no answer (a timeout), a 429 or
+  a 5xx - at once, since a template cannot wait. The audit log is read up to the instant
+  the window ends (toTime), so runs landing meanwhile shift no page. A 409 to a last
+  chunk sent again means the receiver took the first copy and its answer was lost: the
+  push is done.
+
   The rendered output is one line saying what happened; it lands in JMWE's logs.
 
   Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
@@ -34,10 +40,34 @@
 
 
 {%- set NAME = "jmwe" -%}
-{%- set VERSION = "1.3.0" -%}
+{%- set VERSION = "1.5.0" -%}
 {%- set OPTS = { "auth": { "username": EMAIL, "password": TOKEN }, "timeout": 60000 } -%}
 {%- set tenant = ("https://" + SITE + "/_edge/tenant_info") | callRest -%}
 {%- set failures = [] -%}
+
+{#- callRest with up to three tries: no answer (a timeout gives _error and no _statusCode),
+    a 429 or a 5xx is tried again at once. The answer lands in `box` as [answer, tries - 1]:
+    a macro renders text, so it hands objects back through an array. `how` is "get" (with
+    the token), "post" (a JSON body, with the token) or "push" (text, with `opts` as given) -#}
+{%- macro fetch(box, url, how, body, opts) -%}
+{%- for tr in range(0, 3) -%}
+  {%- if tr < 3 and not box.length -%}
+    {%- if how == "push" -%}
+      {%- set r = url | callRest(verb="post", body=body, noJSON=true, dontFail=true, options=opts) -%}
+    {%- elif how == "post" -%}
+      {%- set r = url | callRest(verb="post", body=body, options=OPTS, dontFail=true) -%}
+    {%- else -%}
+      {%- set r = url | callRest(options=OPTS, dontFail=true) -%}
+    {%- endif -%}
+    {%- if not (r._error or r._statusCode) or (r._statusCode and r._statusCode != 429 and r._statusCode < 500) or tr == 2 -%}
+      {%- set _ = box.push(r) -%}
+      {%- set _ = box.push(tr) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
+{#- a GET of the internal API through fetch, as a value: the answer, or the object carrying _error -#}
+{%- macro get(box, path) -%}{%- set _ = fetch(box, INTERNAL + path, "get") -%}{%- endmacro -%}
 
 {#- usage and runs (BETA): the internal API behind Jira's Usage and Audit log tabs -#}
 {%- macro ymd(days) -%}
@@ -85,8 +115,12 @@
           "X-Automap-Seq": "" + ci, "X-Automap-Sender": NAME + "/" + VERSION, "X-Automap-Kind": kind,
           "X-Automap-Last": "1", "X-Automap-Length": "" + body.length } -%}
     {%- endif -%}
-    {%- set res = PUSH_URL | callRest(verb="post", body=body.slice(bounds[ci], bounds[ci + 1]), noJSON=true, dontFail=true, options={ "headers": hdr, "timeout": 60000 }) -%}
-    {%- if res._statusCode -%}{%- set _ = bad.push("HTTP " + res._statusCode) -%}{%- endif -%}
+    {%- set box = [] -%}
+    {%- set _ = fetch(box, PUSH_URL, "push", body.slice(bounds[ci], bounds[ci + 1]), { "headers": hdr, "timeout": 60000 }) -%}
+    {%- set res = box[0] -%}
+    {#- a 409 to the last chunk sent again: the first copy was taken, its answer lost - the push is done -#}
+    {%- if res._statusCode == 409 and box[1] > 0 and ci == n - 1 -%}
+    {%- elif res._statusCode or res._error -%}{%- set _ = bad.push(("HTTP " + res._statusCode) if res._statusCode else "no answer") -%}{%- endif -%}
   {%- endif -%}
 {%- endfor -%}
 {{- bad[0] if bad.length else "" -}}
@@ -107,7 +141,7 @@
     {%- if pi < periods.length and not uStop.length -%}
       {%- set pd = periods[pi] -%}
       {%- set q = "startTime=" + pd[0] + "&endTime=" + pd[1] -%}
-      {%- set credit = (INTERNAL + "creditUsage?" + q) | callRest(options=OPTS, dontFail=true) -%}
+      {%- set cbox = [] -%}{%- set _ = get(cbox, "creditUsage?" + q) -%}{%- set credit = cbox[0] -%}
       {%- if credit._statusCode or credit._error -%}
         {%- set _ = uStop.push("usage (beta) skipped: creditUsage answered " + (credit._statusCode or "nothing")) -%}
       {%- else -%}
@@ -120,7 +154,7 @@
           {%- set done = [] -%}
           {%- for page in range(0, 100) -%}
             {%- if page < 100 and not done.length and not bad.length -%}
-              {%- set r = (INTERNAL + "highUsageFlows?limit=100&page=" + page + "&sortBy=" + sortBy + "&" + q) | callRest(options=OPTS, dontFail=true) -%}
+              {%- set fbox = [] -%}{%- set _ = get(fbox, "highUsageFlows?limit=100&page=" + page + "&sortBy=" + sortBy + "&" + q) -%}{%- set r = fbox[0] -%}
               {%- if r._statusCode or r._error -%}
                 {%- set _ = bad.push("highUsageFlows answered " + (r._statusCode or "nothing")) -%}
               {%- else -%}
@@ -149,24 +183,24 @@
           {%- set _ = uStop.push("usage (beta) skipped: " + bad[0]) -%}
         {%- else -%}
           {#- the rest is the current billing model, and the least stable part: each piece optional -#}
-          {%- set top = (INTERNAL + "highestUsages?limit=100&month=" + pd[2]) | callRest(options=OPTS, dontFail=true) -%}
+          {%- set tbox = [] -%}{%- set _ = get(tbox, "highestUsages?limit=100&month=" + pd[2]) -%}{%- set top = tbox[0] -%}
           {%- set bill = [] -%}
           {%- if not top._statusCode and not top._error and top.length is defined -%}
             {%- for t in top -%}{%- if t.ruleIdUuid -%}{%- set _ = bill.push({ "uuid": t.ruleIdUuid, "runs": t.executionCount or 0 }) -%}{%- endif -%}{%- endfor -%}
           {%- endif -%}
-          {%- set ctx = (INTERNAL + "pagecontext") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set xbox = [] -%}{%- set _ = get(xbox, "pagecontext") -%}{%- set ctx = xbox[0] -%}
           {%- set lims = [] -%}
-          {%- if not ctx._statusCode and ctx.tenantPageContext and ctx.tenantPageContext.usage and ctx.tenantPageContext.usage.workspaceUsages -%}
+          {%- if not ctx._statusCode and not ctx._error and ctx.tenantPageContext and ctx.tenantPageContext.usage and ctx.tenantPageContext.usage.workspaceUsages -%}
             {%- for k, v in ctx.tenantPageContext.usage.workspaceUsages -%}
               {%- set _ = lims.push({ "product": k, "used": v.executionsUsed or 0, "limit": v.executionLimit or 0, "edition": v.edition or "" }) -%}
             {%- endfor -%}
           {%- endif -%}
-          {%- set tr = (INTERNAL + "usageTrendData") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set rbox = [] -%}{%- set _ = get(rbox, "usageTrendData") -%}{%- set tr = rbox[0] -%}
           {%- set trend = [] -%}
-          {%- if not tr._statusCode and tr.data -%}
+          {%- if not tr._statusCode and not tr._error and tr.data -%}
             {%- for t in tr.data -%}{%- set _ = trend.push({ "month": t.month, "runs": t.workspaceCounts or {} }) -%}{%- endfor -%}
           {%- endif -%}
-          {%- set pack = (INTERNAL + "hasCreditPack") | callRest(options=OPTS, dontFail=true) -%}
+          {%- set pbox = [] -%}{%- set _ = get(pbox, "hasCreditPack") -%}{%- set pack = pbox[0] -%}
           {%- set ca = credit.automation or {} -%}
           {%- set cr = credit.rovo or {} -%}
           {%- set head = '{"period":' + ({ "start": pd[0], "end": pd[1] } | dump)
@@ -174,7 +208,7 @@
               + ',"rovo":' + ({ "total": cr.total or 0, "jira": cr.currentProduct or 0, "other": cr.everywhereElse or 0 } | dump) -%}
           {%- set tail = ((',"billable":' + ({ "month": pd[2], "rules": bill } | dump)) if (not top._statusCode and not top._error) else "")
               + ((',"limits":' + (lims | dump)) if lims.length else "")
-              + ((',"trend":' + (trend | dump)) if (not tr._statusCode and tr.data) else "")
+              + ((',"trend":' + (trend | dump)) if (not tr._statusCode and not tr._error and tr.data) else "")
               + ((',"creditPack":' + ("true" if pack.hasCreditPack else "false")) if (not pack._statusCode and not pack._error) else "") -%}
           {%- set doc = '{"usage":' + head + ',"flows":' + (flows | dump) + tail + '},"sender":{"name":"' + NAME + '","version":"' + VERSION + '"}}' -%}
           {%- set said = "" + (pushKind("usage", doc) | trim) -%}
@@ -190,10 +224,20 @@
 {%- if RUNS and closed.length -%}
   {%- set _ = notes.push("runs (beta) skipped: the map does not take them (403)") -%}
 {%- endif -%}
+{#- an instant as ISO 8601 with milliseconds and Z, from Unix ms, without a date library -#}
+{%- macro iso(ms) -%}
+{%- set rest = ms % 86400000 -%}
+{%- set hh = rest // 3600000 -%}{%- set mi = (rest % 3600000) // 60000 -%}{%- set ss = (rest % 60000) // 1000 -%}{%- set ml = rest % 1000 -%}
+{{- ymd(ms // 86400000) | trim }}T{{ ("0" if hh < 10 else "") + hh }}:{{ ("0" if mi < 10 else "") + mi }}:{{ ("0" if ss < 10 else "") + ss }}.{{ ("00" if ml < 10 else ("0" if ml < 100 else "")) + ml }}Z
+{%- endmacro -%}
 {%- if RUNS and not shut and not closed.length -%}
   {%- set days = (RUNS_DAYS if RUNS_DAYS >= 1 else 1) if RUNS_DAYS <= 30 else 30 -%}
   {%- set startDay = dayNow - days -%}
   {%- set startMs = startDay * 86400000 -%}
+  {#- the log is newest first and paged by offset: runs landing while it is read would
+      shift every page, so the read ends at the instant the window does (toTime) -#}
+  {#- a macro's output is a SafeString: "" + makes it the plain text the API gets -#}
+  {%- set window = { "fromTime": (ymd(startDay) | trim) + "T00:00:00.000Z", "toTime": "" + (iso(nowMs) | trim) } -%}
   {%- set rStop = [] -%}
   {%- set records = [] -%}
   {%- set more = [1] -%}
@@ -203,7 +247,9 @@
       {%- if pg >= RUNS_MAX_PAGES -%}
         {%- set _ = rStop.push("runs (beta) skipped: the audit log of " + days + " days is longer than " + RUNS_MAX_PAGES + " pages; set RUNS_DAYS lower") -%}
       {%- else -%}
-        {%- set a = (INTERNAL + "auditlog") | callRest(verb="post", body={ "fromTime": (ymd(startDay) | trim) + "T00:00:00.000Z", "offset": pg * 50, "limit": 50 }, options=OPTS, dontFail=true) -%}
+        {%- set abox = [] -%}
+        {%- set _ = fetch(abox, INTERNAL + "auditlog", "post", { "fromTime": window.fromTime, "toTime": window.toTime, "offset": pg * 50, "limit": 50 }) -%}
+        {%- set a = abox[0] -%}
         {%- if a._statusCode or a._error -%}
           {%- set _ = rStop.push("runs (beta) skipped: auditlog answered " + (a._statusCode or "nothing")) -%}
         {%- else -%}
@@ -258,7 +304,7 @@
       {%- if spent.length < 40 and (perRule | select("equalto", f.uuid) | list | length) < 2 -%}
         {%- set _ = perRule.push(f.uuid) -%}
         {%- set _ = spent.push(1) -%}
-        {%- set d = (INTERNAL + "auditlog/item/" + f.id) | callRest(options=OPTS, dontFail=true) -%}
+        {%- set dbox = [] -%}{%- set _ = get(dbox, "auditlog/item/" + f.id) -%}{%- set d = dbox[0] -%}
         {%- if not d._statusCode and not d._error and d.content -%}
           {%- for cl in (d.content.componentLogs or []) -%}
             {%- set res = cl.executionResult or {} -%}

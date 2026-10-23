@@ -24,6 +24,7 @@ const PLATFORM = ['--platform', process.arch === 'arm64' ? 'linux/arm64' : 'linu
 const FILES = {
   python: 'python/automap_sync.py', node: 'node/automap-sync.mjs', bash: 'bash/automap-sync.sh',
   powershell: 'powershell/automap-sync.ps1', scriptrunner: 'scriptrunner/AutomapSync.groovy',
+  scriptrunnerUsage: 'scriptrunner/AutomapUsage.groovy', jmwe: 'jmwe/automap-sync.njk', jmweUsage: 'jmwe/automap-usage.njk',
 };
 function versionOf(name) {
   const text = readFileSync(join(root, FILES[name]), 'utf8');
@@ -126,13 +127,14 @@ for (const s of SENDERS) {
       assert.deepEqual(new Set(uuidsOf(site.state.loaded[0])), new Set(rules.map((r) => r.uuid)), 'every rule, once');
       assert.deepEqual([...site.state.senders], [`${s.name}/${versionOf(s.name)}`]);
 
-      // one run for the day, the header on every chunk, the slices cut by sorted uuid without overlap
+      // one run for the day, the header on every chunk, the slices cut by each rule's own id
+      // (its first 8 hex digits mod M), so a rule's part never depends on the rest of the list
       const run = todayRun();
       assert.ok(site.state.requests.every((r) => r.run === run && /^[12]\/2$/.test(r.part)), JSON.stringify(site.state.requests));
       const group = site.state.partRuns.get(run);
       const sorted = rules.map((r) => r.uuid).sort();
-      assert.deepEqual(uuidsOf(group.done.get(1)), sorted.slice(0, 4));
-      assert.deepEqual(uuidsOf(group.done.get(2)), sorted.slice(4));
+      assert.deepEqual(uuidsOf(group.done.get(1)), sorted.filter((u) => partOf(u, 2) === 1));
+      assert.deepEqual(uuidsOf(group.done.get(2)), sorted.filter((u) => partOf(u, 2) === 2));
 
       // the same part again today: the run is built, and the sender says so instead of retrying
       const again = await runSender(s, site, { PART: '1/2' });
@@ -148,6 +150,124 @@ for (const s of SENDERS) {
         assert.match(r.out, /PART must be/);
         assert.equal(site.state.apiCalls.length, calls, `PART=${bad}: nothing read`);
       }
+    } finally {
+      await site.close();
+    }
+    // two rules deleted between the copies move no other rule across the cut: a slice by
+    // position would start part 2 later and leave a rule near the boundary in neither part
+    const eight = makeRules(8);
+    const shrinking = await startFakeSite({ rules: eight, host, flaky: false });
+    try {
+      const first = await runSender(s, shrinking, { PART: '1/2' });
+      assert.equal(first.code, 0, first.out);
+      const carried = eight.filter((r) => partOf(r.uuid, 2) === 1);
+      assert.equal(carried.length, 4);
+      eight.splice(eight.indexOf(carried[0]), 1);
+      eight.splice(eight.indexOf(carried[1]), 1);
+      const second = await runSender(s, shrinking, { PART: '2/2' });
+      assert.equal(second.code, 0, second.out);
+      assert.equal(shrinking.state.loaded.length, 1, second.out);
+      assert.deepEqual(new Set(uuidsOf(shrinking.state.loaded[0])), new Set(makeRules(8).map((r) => r.uuid)), 'every rule listed that day, once');
+    } finally {
+      await shrinking.close();
+    }
+  });
+
+  // the answer to the last chunk lost after the receiver took it (a timeout): the resend is 409,
+  // and that is the push done - not a fresh run that would load the day's rules twice
+  test(`${s.name}: a lost answer to the last chunk is not a second push`, opts, async () => {
+    const site = await startFakeSite({ rules: makeRules(5), host, flaky: false, lose: 'rules' });
+    try {
+      const { code, out } = await runSender(s, site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' });
+      assert.equal(code, 0, out);
+      assert.equal(site.state.lost, 1, 'the fake lost the answer to the last chunk');
+      assert.equal(site.state.loaded.length, 1, `${out}\n${JSON.stringify(site.state.answers)}`);
+      assert.deepEqual(site.state.answers.slice(-2), ['queued', 'conflict'], JSON.stringify(site.state.answers));
+      assert.match(out, /already taken/);
+      if (s.parts) {
+        const parts = await startFakeSite({ rules: makeRules(7), host, flaky: false, lose: 'rules' });
+        try {
+          const one = await runSender(s, parts, { PART: '1/2' });
+          assert.equal(one.code, 0, one.out);
+          assert.match(one.out, /part 1\/2: .*already taken/);
+          assert.equal(parts.state.loaded.length, 0);
+          const two = await runSender(s, parts, { PART: '2/2' });
+          assert.equal(two.code, 0, two.out);
+          assert.equal(parts.state.loaded.length, 1, two.out);
+          assert.deepEqual(new Set(uuidsOf(parts.state.loaded[0])), new Set(makeRules(7).map((r) => r.uuid)));
+        } finally {
+          await parts.close();
+        }
+      }
+    } finally {
+      await site.close();
+    }
+  });
+
+  // the audit log is newest first and offset-paged; runs that land while the sender pages
+  // shift every page unless the read is bounded by toTime = the window's end
+  test(`${s.name}: the audit log is read up to the instant the window ends, so runs landing meanwhile shift no page`, opts, async () => {
+    const site = await startFakeSite({ rules: makeRules(3), host, flaky: false, audit: { size: 130, grow: 7 } });
+    try {
+      const { code, out } = s.usageFile ? await runSender(s, site, {}, [], s.usageFile) : await runSender(s, site);
+      assert.equal(code, 0, out);
+      assert.equal(site.state.pushed.runs.length, 1, out);
+      const r = site.state.pushed.runs[0].runs;
+      const calls = site.state.audit.calls;
+      assert.ok(calls.length >= 3, `${calls.length} pages read`);
+      for (const c of calls) {
+        assert.match(String(c.toTime), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `toTime on every page: ${JSON.stringify(c)}`);
+        assert.equal(Date.parse(c.toTime), r.window.end, 'toTime is the instant stamped as window.end');
+        assert.equal(Date.parse(c.fromTime), r.window.start, 'fromTime is window.start');
+      }
+      const runs = r.rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0);
+      assert.equal(runs, 130, `every run before the window's end once, none of the ${site.state.audit.records.length - 130} that landed meanwhile: ${out}`);
+    } finally {
+      await site.close();
+    }
+  });
+
+  // a non-retryable answer from the Automation API names what was being read and how far
+  // the sender got - never the rule's id (the README promises the log holds no rule)
+  test(`${s.name}: a rule the API will not give names no rule id in the log, and a 200 that is not JSON is exit 3`, opts, async () => {
+    const rules = makeRules(3);
+    const site = await startFakeSite({ rules, host, flaky: false, missing: rules[1].uuid });
+    const junk = await startFakeSite({ rules, host, flaky: false, garbage: true });
+    try {
+      const { code, out } = await runSender(s, site);
+      assert.equal(code, 3, out);
+      assert.ok(!out.includes(rules[1].uuid) && !out.includes('aaaa-4bbb'), `no rule id in the log: ${out}`);
+      assert.match(out, /answered 404 for rule 2 of 3/);
+      assert.equal(site.state.loaded.length, 0);
+      const bad = await runSender(s, junk);
+      assert.equal(bad.code, 3, bad.out);
+      assert.match(bad.out, /not JSON/);
+      assert.ok(!/Traceback|Exception|at .*\.(mjs|js|groovy):\d+/.test(bad.out), `a plain message, not a stack: ${bad.out}`);
+      assert.equal(junk.state.loaded.length, 0);
+    } finally {
+      await site.close();
+      await junk.close();
+    }
+  });
+
+  // the audit log is read 50,000 records deep at most; past that the oldest day read is
+  // incomplete, and pushing it whole would replace the map's complete count with a smaller one
+  test(`${s.name}: an audit log past 50,000 records drops its oldest, incomplete day and shortens the window`, { ...opts, timeout: 600_000, skip: s.usageFile ? `${s.name}: reads yesterday and today within its host's time budget instead` : opts.skip }, async () => {
+    const site = await startFakeSite({ rules: makeRules(3), host, flaky: false, audit: { size: 50050 } });
+    try {
+      const { code, out } = await runSender(s, site, { AUTOMAP_USAGE: 'off' });
+      assert.equal(code, 0, out);
+      assert.equal(site.state.pushed.runs.length, 1, out);
+      const r = site.state.pushed.runs[0].runs;
+      const read = site.state.audit.records.slice(0, 50000);
+      const oldest = Math.min(...read.map((x) => x.eventTimestamp));
+      const cut = oldest - (oldest % 86400000) + 86400000;
+      assert.equal(r.window.start, cut, 'the window starts on the first complete day');
+      const expected = site.state.audit.records.filter((x) => x.eventTimestamp >= cut).length;
+      const runs = r.rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0);
+      assert.equal(runs, expected, out);
+      assert.ok(r.rows.every((x) => Date.parse(`${x.day}T00:00:00Z`) >= cut), 'no row of the dropped day');
+      assert.match(out, /shortened/);
     } finally {
       await site.close();
     }
@@ -182,11 +302,13 @@ for (const s of SENDERS) {
     return { code: first.code || second.code, out: first.out + second.out };
   };
   const rules = makeRules(3);
-  const site = await startFakeSite({ rules, host, flaky: false });
+  const site = await startFakeSite({ rules, host, flaky: false, internalFlaky: true });
   const broken = await startFakeSite({ rules, host, flaky: false, usage: 'broken' });
+  const lost = await startFakeSite({ rules, host, flaky: false, lose: 'usage' });
   try {
     const { code, out } = await runBoth(site);
     assert.equal(code, 0, out);
+    assert.deepEqual(site.state.internalTrips, ['creditUsage', 'auditlog', 'auditlog/item/101'], 'a 500, a 429 with Retry-After and a 500 on a detail, each retried');
     assert.equal(site.state.loaded.length, 1, 'the rules, once');
     assert.equal(site.state.pushed.usage.length >= 1, true, out);
     const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
@@ -231,16 +353,28 @@ for (const s of SENDERS) {
     assert.match(gone.out, /usage \(beta\) skipped/);
     assert.match(gone.out, /runs \(beta\) skipped/);
 
+    // the answer to a usage push's last chunk lost: the resend is 409, and that is the push taken
+    const late = await runBoth(lost);
+    assert.equal(late.code, 0, late.out);
+    assert.equal(lost.state.lost, 1);
+    assert.equal(lost.state.pushed.usage.length, 1, late.out);
+    assert.match(late.out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+    assert.doesNotMatch(late.out, /usage \(beta\) \d{4}-\d{2}: not taken/);
+
     // switched off: not even read
-    const before = site.state.pushed.usageCalls;
+    const before = site.state.usageCalls;
     assert.equal((await runBoth(site, { AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
-    assert.equal(site.state.pushed.usageCalls, before);
+    assert.equal(site.state.usageCalls, before);
   } finally {
     await site.close();
     await broken.close();
+    await lost.close();
   }
 });
 }
+
+/** The part a rule belongs to: its uuid's first 8 hex digits as a number, mod M, plus 1. */
+const partOf = (uuid, m) => (parseInt(uuid.slice(0, 8), 16) % m) + 1;
 
 // JMWE renders a template instead of running a program: no exit codes, one line of output.
 // It needs the nunjucks package (NUNJUCKS_DIR, a folder with node_modules/nunjucks).
@@ -257,17 +391,23 @@ function runJmwe(site, extraEnv = {}) {
   });
 }
 test('jmwe: rules, usage and runs (beta), apart from each other, without ids, never stopping the rules', { skip: nunjucksDir ? false : 'jmwe: set NUNJUCKS_DIR to a folder with nunjucks installed', timeout: 240_000 }, async () => {
-  const rules = makeRules(3);
-  const site = await startFakeSite({ rules, flaky: false });
+  const rules = makeRules(7);
+  // flaky: a 429 with Retry-After on the second page of summaries, a 500 on the second chunk,
+  // and once each a 500 and a 429 on the internal API - a template cannot wait, but it can retry
+  const site = await startFakeSite({ rules, internalFlaky: true });
   const broken = await startFakeSite({ rules, flaky: false, usage: 'broken' });
+  const lost = await startFakeSite({ rules, flaky: false, lose: 'usage' });
   try {
     // two Scheduled actions: the rules template alone reads no usage and no audit log
     const rulesOnly = await runJmwe(site);
     assert.equal(rulesOnly.code, 0, rulesOnly.out);
     assert.equal(site.state.loaded.length, 1, rulesOnly.out);
+    assert.deepEqual(site.state.loaded[0].rules, expectedRules(rules));
+    assert.ok(site.state.answers.includes('failed'), 'the 500 was met and retried');
     assert.equal(site.state.usageCalls, 0, 'the rules template leaves usage and runs to the other one');
     const { code, out } = await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk' });
     assert.equal(code, 0, out);
+    assert.deepEqual(site.state.internalTrips, ['creditUsage', 'auditlog', 'auditlog/item/101'], 'each refusal retried');
     assert.equal(site.state.loaded.length, 1, 'the usage template pushes no rules');
     const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
     assert.equal(u.steps.total, 1310);
@@ -296,6 +436,11 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     const today = new Date().toISOString().slice(0, 10);
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     assert.ok(r.rows.every((x) => x.day === today || x.day === yesterday), JSON.stringify(r.rows.map((x) => x.day)));
+    // the audit log read up to the instant the window ends, on every page
+    for (const c of site.state.audit.calls) {
+      assert.match(String(c.toTime), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, JSON.stringify(c));
+      assert.equal(Date.parse(c.toTime), r.window.end);
+    }
 
     assert.equal((await runJmwe(broken)).code, 0);
     assert.equal(broken.state.loaded.length, 1, 'the rules go whatever the internal API does');
@@ -305,12 +450,62 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     assert.match(gone.out, /usage \(beta\) skipped/);
     assert.match(gone.out, /runs \(beta\) skipped/);
 
+    // the answer to a usage push's last chunk lost: the resend is 409, and that is the push taken
+    const late = await runJmwe(lost, { JMWE_TEMPLATE: 'automap-usage.njk' });
+    assert.equal(late.code, 0, late.out);
+    assert.equal(lost.state.lost, 1);
+    assert.equal(lost.state.pushed.usage.length, 1, late.out);
+    assert.match(late.out, /usage \(beta\) \d{4}-\d{2}: pushed 1310 steps for 2 rules/);
+
     const before = site.state.usageCalls;
     assert.equal((await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk', AUTOMAP_USAGE: 'off', AUTOMAP_RUNS: 'off' })).code, 0);
     assert.equal(site.state.usageCalls, before);
   } finally {
     await site.close();
     await broken.close();
+    await lost.close();
+  }
+});
+
+test('jmwe: a lost answer to the last chunk is not a second push; a lost chunk is sent again; the log grows under the paging', { skip: nunjucksDir ? false : 'jmwe: set NUNJUCKS_DIR to a folder with nunjucks installed', timeout: 240_000 }, async () => {
+  const site = await startFakeSite({ rules: makeRules(5), flaky: false, lose: 'rules' });
+  const parts = await startFakeSite({ rules: makeRules(7), flaky: false, lose: 'rules' });
+  const growing = await startFakeSite({ rules: makeRules(3), flaky: false, audit: { size: 130, grow: 7 } });
+  const missing = await startFakeSite({ rules: makeRules(3), flaky: false, missing: makeRules(3)[1].uuid });
+  try {
+    const { code, out } = await runJmwe(site);
+    assert.equal(code, 0, out);
+    assert.equal(site.state.lost, 1);
+    assert.equal(site.state.loaded.length, 1, `${out}\n${JSON.stringify(site.state.answers)}`);
+    assert.deepEqual(site.state.answers.slice(-2), ['queued', 'conflict']);
+    assert.match(out, /already taken/);
+
+    const one = await runJmwe(parts, { PART: '1/2' });
+    assert.equal(one.code, 0, one.out);
+    assert.match(one.out, /part 1\/2: .*already taken/);
+    assert.equal(parts.state.loaded.length, 0);
+    const two = await runJmwe(parts, { PART: '2/2' });
+    assert.equal(two.code, 0, two.out);
+    assert.equal(parts.state.loaded.length, 1, two.out);
+    assert.deepEqual(new Set(uuidsOf(parts.state.loaded[0])), new Set(makeRules(7).map((r) => r.uuid)));
+
+    const grew = await runJmwe(growing, { JMWE_TEMPLATE: 'automap-usage.njk' });
+    assert.equal(grew.code, 0, grew.out);
+    const r = growing.state.pushed.runs[0].runs;
+    assert.ok(growing.state.audit.calls.length >= 3);
+    for (const c of growing.state.audit.calls) assert.equal(Date.parse(c.toTime), r.window.end, JSON.stringify(c));
+    assert.equal(r.rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0), 130, grew.out);
+
+    // a rule the API will not give: the result line says which read failed, never the rule's id
+    const gone = await runJmwe(missing);
+    assert.match(gone.out, /failed - \[3\] the Automation API answered 404 for rule 2 of 3/, gone.out);
+    assert.ok(!gone.out.includes('aaaa-4bbb'), `no rule id in the log: ${gone.out}`);
+    assert.equal(missing.state.loaded.length, 0);
+  } finally {
+    await site.close();
+    await parts.close();
+    await growing.close();
+    await missing.close();
   }
 });
 
@@ -331,15 +526,15 @@ test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map
     assert.equal(site.state.answers[site.state.answers.length - 1], 'queued');
     assert.equal(site.state.loaded.length, 1, second.out);
     assert.deepEqual(new Set(uuidsOf(site.state.loaded[0])), new Set(rules.map((r) => r.uuid)), 'every rule, once');
-    assert.deepEqual([...site.state.senders], ['jmwe/1.4.0']);
+    assert.deepEqual([...site.state.senders], [`jmwe/${versionOf('jmwe')}`]);
 
     const run = todayRun();
     assert.ok(site.state.requests.every((r) => r.run === run && /^[12]\/2$/.test(r.part)), JSON.stringify(site.state.requests));
     assert.ok(site.state.requests.length > 2, 'small chunks mean several requests per part');
     const group = site.state.partRuns.get(run);
     const sorted = rules.map((r) => r.uuid).sort();
-    assert.deepEqual(uuidsOf(group.done.get(1)), sorted.slice(0, 4));
-    assert.deepEqual(uuidsOf(group.done.get(2)), sorted.slice(4));
+    assert.deepEqual(uuidsOf(group.done.get(1)), sorted.filter((u) => partOf(u, 2) === 1));
+    assert.deepEqual(uuidsOf(group.done.get(2)), sorted.filter((u) => partOf(u, 2) === 2));
 
     // the same part again today: 409, said plainly in the result line
     const again = await runJmwe(site, { PART: '1/2' });
@@ -350,13 +545,13 @@ test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map
     for (const bad of ['2/1', 'x', '1/1', '0/2', '1/21', '1/2/3']) {
       const calls = site.state.apiCalls.length;
       const r = await runJmwe(site, { PART: bad });
-      assert.match(r.out, /^automap-sync jmwe 1\.4\.0: failed - \[2\] PART must be/, `PART=${bad}: ${r.out}`);
+      assert.match(r.out, new RegExp(`^automap-sync jmwe ${versionOf('jmwe').replace(/\./g, '\\.')}: failed - \\[2\\] PART must be`), `PART=${bad}: ${r.out}`);
       assert.equal(site.state.apiCalls.length, calls, `PART=${bad}: nothing read`);
     }
     // so is a JMWE without a clock: a part cannot name its day, and must not push as 1970's
     const calls = site.state.apiCalls.length;
     const noClock = await runJmwe(site, { PART: '1/2', JMWE_NO_CLOCK: '1' });
-    assert.match(noClock.out, /^automap-sync jmwe 1\.4\.0: failed - \[2\] no clock \(now\): parts need the UTC date/, noClock.out);
+    assert.match(noClock.out, /^automap-sync jmwe \d+\.\d+\.\d+: failed - \[2\] no clock \(now\): parts need the UTC date/, noClock.out);
     assert.equal(site.state.apiCalls.length, calls, 'nothing read without a clock');
     assert.ok(!site.state.requests.some((r) => r.run === 'd19700101'), 'no push under 1970');
     // without PART nothing changes on the wire
@@ -367,7 +562,45 @@ test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map
     } finally {
       await plain.close();
     }
+    // two rules deleted between the copies move no other rule across the cut
+    const eight = makeRules(8);
+    const shrinking = await startFakeSite({ rules: eight, flaky: false });
+    try {
+      const one = await runJmwe(shrinking, { PART: '1/2' });
+      assert.equal(one.code, 0, one.out);
+      const carried = eight.filter((r) => partOf(r.uuid, 2) === 1);
+      eight.splice(eight.indexOf(carried[0]), 1);
+      eight.splice(eight.indexOf(carried[1]), 1);
+      const two = await runJmwe(shrinking, { PART: '2/2' });
+      assert.equal(two.code, 0, two.out);
+      assert.equal(shrinking.state.loaded.length, 1, two.out);
+      assert.deepEqual(new Set(uuidsOf(shrinking.state.loaded[0])), new Set(makeRules(8).map((r) => r.uuid)), 'every rule listed that day, once');
+    } finally {
+      await shrinking.close();
+    }
   } finally {
     await site.close();
   }
+});
+
+// what ships next to the senders: the CI examples, the image and its release
+test('the published files: GitLab runs the image through Docker, the release is pinned, the image tag is the Python version', () => {
+  const read = (f) => readFileSync(join(root, f), 'utf8');
+  const gitlab = read('ci/gitlab-ci.yml');
+  assert.doesNotMatch(gitlab, /name:\s*ghcr\.io\/moy-apps\/automap-sync/, 'a distroless image has no shell for GitLab to run script: in');
+  assert.match(gitlab, /docker run .*ghcr\.io\/moy-apps\/automap-sync:1/);
+  const release = read('.github/workflows/release.yml');
+  for (const m of release.matchAll(/uses:\s*(\S+)/g)) assert.match(m[1], /@[0-9a-f]{40}\b/, `${m[1]}: pin the action by commit`);
+  assert.match(release, /automap_sync\.py/, 'the image tags come from VERSION in the Python sender');
+  const docker = read('docker/Dockerfile');
+  assert.match(docker, /^FROM \S+@sha256:[0-9a-f]{64}/m, 'the base image is pinned by digest');
+  assert.match(read('powershell/automap-sync.ps1').split('\n').slice(0, 2).join('\n'), /^#Requires -Version 7\.2$/m);
+  // one version per sender, in the file, the README's matrix and the package
+  const api = read('API.md');
+  for (const name of ['python', 'node', 'bash', 'powershell', 'scriptrunner', 'jmwe']) {
+    const v = versionOf(name);
+    assert.ok(api.split('\n').some((l) => l.startsWith(`| ${v} |`) && l.includes(name)), `API.md: no version-matrix row for ${name} ${v}`);
+  }
+  assert.equal(versionOf('scriptrunnerUsage'), versionOf('scriptrunner'), 'both ScriptRunner scripts carry one version');
+  assert.equal(versionOf('jmweUsage'), versionOf('jmwe'), 'both JMWE templates carry one version');
 });
