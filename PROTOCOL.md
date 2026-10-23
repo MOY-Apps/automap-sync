@@ -269,7 +269,11 @@ not do this for you — every completed run is a build).
   constant time. One key per site; a new key revokes the old one immediately.
 - Every request is counted against the throttle before the key is read, so a caller that
   has the URL but not the key gets `401` up to the limit and `429 rate-limited` past it,
-  like anyone else: guessing at the key cannot run unmetered.
+  like anyone else: guessing at the key cannot run unmetered. The other side of that coin:
+  anyone holding the receiver URL alone can use up the 500 requests of a 10-minute window
+  and hold the real sender off (`429 rate-limited`) for up to ten minutes at a time. Keep
+  the URL as private as the key - it is not a secret in the cryptographic sense, but it is
+  the handle on the sender's window.
 - The receiver cannot return data: its responses are fixed in the manifest.
 - Rule configurations can contain credentials typed into rules (and, per AUTO-2211, hidden
   header values). The sender passes them through TLS to the app, where the build replaces

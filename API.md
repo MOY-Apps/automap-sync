@@ -377,7 +377,7 @@ last chunk, the proof (`422`).
 |---|---|
 | One chunk | 262,144 bytes of UTF-8 (`413` above). Send 200,000 |
 | Chunks in one push | 400 (`X-Automap-Seq` 0 to 399) |
-| Requests | 500 per key in a fixed 10-minute window, every request with the right key counted, refused ones too (`429 rate-limited`) |
+| Requests | 500 per installation in a fixed 10-minute window, every request counted before the key is read - with the right key, a wrong one or none, refused ones too (`429 rate-limited`). So anyone holding the receiver URL can use up the window and hold the real sender off for up to ten minutes: keep the URL as private as the key |
 | Rules pushes that build | Advanced: 5 in a rolling day, files and pushes alike (`429 allowance`) |
 | Usage rules | up to 10,000 a month (what Atlassian lists); Advanced keeps all |
 | Runs | window of at most 31 days; 100,000 rows (20,000 a day) and 500 errors per push; 35 days kept |
@@ -401,6 +401,11 @@ What each released version of our senders sends. The Docker image
 | 1.4.0 | scriptrunner, jmwe | rules in parts (`PART=N/M`, `X-Automap-Part`), for sites past the host's time limit |
 | 1.3.0 | python, node, bash, powershell | as 1.2.0 on the wire to the receiver. A `409` to a resent last chunk ends the push instead of starting a second run; the audit log is read with `toTime` and, past 50,000 records, pushed from its first complete day; the internal API is retried honouring `Retry-After` |
 | 1.5.0 | scriptrunner, jmwe | as 1.4.0 on the wire to the receiver. Parts cut by each rule's own id (roughly equal slices); the resent-`409` rule above; JMWE retries every request (at once) and restarts once on `409`/`422` |
+
+JMWE's retries are immediate: a Nunjucks template cannot sleep, so a request that gets a
+`429`, a `5xx` or no answer is sent again at once, three times in all. A real `429` - the
+window used up - lasts minutes, so the three tries can go in a second and the job then
+fails for that run; the next scheduled run pushes again. Nothing else is to be done.
 
 Latest today: python, node, bash and powershell **1.3.0**; scriptrunner and jmwe **1.5.0**.
 The same list is in [`openapi.json`](openapi.json) under `x-automap-senders`.
