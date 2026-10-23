@@ -237,7 +237,7 @@ Atlassian). Read the **status code**; the `error` word separates the two 429s.
 | 200 | `alive` | — |
 | 202 | `{"accepted":true}` — chunk stored | send the next chunk |
 | 202 | `{"accepted":true,"queued":true}` — final chunk, checksum good, build queued | done; the map rebuilds in a minute or two |
-| 400 | `bad-request` — a header missing or malformed, `X-Automap-Seq` 400 or more (at most 400 chunks a run), empty or compressed body, `Last` without a checksum; for usage and runs also a joined body that is not JSON or not of its kind | fix the sender; do not retry as is |
+| 400 | `bad-request` — a header missing or malformed, `X-Automap-Seq` 400 or more (at most 400 chunks a run), empty or compressed body, `Last` without a checksum; for usage and runs also a joined body that is not JSON or not of its kind (a runs `mode` other than `slice`; a slice over 24 hours, empty, or ending in the future) | fix the sender; do not retry as is |
 | 401 | `unauthorized` — no key, wrong key, revoked key | stop; the administrator makes a new key |
 | 402 | `inactive` — the subscription on this site has ended | stop |
 | 403 | `disabled` — this installation does not take pushes: switched off, or the site is on Basic, where the map loads from an export file only (remembered as `plan` on the settings page) | stop |
@@ -395,6 +395,51 @@ pushed again; nothing about the push changes for it, and old senders feed it as 
 The card shows a rule's runs over the last 30 days, the failing component in words and,
 once a month is folded, its runs by month; the Usage tab lists the rules that fail most,
 the ones that mostly do nothing, and the site's runs per month.
+
+**Slices (APPS-507).** A sender that cannot read a whole busy day in one run - ScriptRunner
+within its 200 s, JMWE within its 60 pages - pushed yesterday and today as it managed to read
+them, and the receiver replaced two complete days with partial counts. Such a sender pushes
+one clock hour at a time instead, `"mode": "slice"`, and the receiver adds the hour to its
+day rather than replacing the day:
+
+```json
+{"runs":{"mode":"slice","window":{"start":1791968400000,"end":1791972000000},
+  "rows":[{"uuid":"019dd4aa-…","day":"2026-10-14","success":2,"errors":1,"noop":0,"edits":0,
+           "ms":9000,"maxMs":4000,"hours":{"9":3}}],
+  "errors":[]},
+ "sender":{"name":"jmwe","version":"1.6.0"}}
+```
+
+- `mode` is `slice` or absent. Absent is the push above, the window's days replaced - what
+  every sender released so far sends, unchanged. Any other value is not a runs payload
+  (`400 bad-request`).
+- `window` is the half-open interval `[start, end)` in Unix ms. Our senders push the
+  previous full clock hour in UTC (`start` the hour's start, `end` its end); the receiver
+  takes any interval up to 24 hours long with `end` after `start` and no later than 5
+  minutes past its own clock - longer, empty or later is a `400` (`sanitizeRuns`).
+- `rows` are per rule and UTC day as above, counting only the runs whose timestamp falls
+  inside the window, `hours` the slice's hours only. A slice aligned to the hour never
+  crosses midnight; one that does carries a row per day anyway.
+- The receiver remembers the intervals it took (`runs_slices`, v042, 35 days with the
+  days). A slice that overlaps one already taken is dropped by the `store-runs` job
+  (`skipped: 'covered'`): added to nothing, its errors not kept. The sender cannot tell -
+  the last chunk is answered the static `202 queued` before the job runs, as every runs push
+  is - so a re-push of a covered hour is silently dropped. That is why the senders push the
+  *previous* full hour: a job that runs twice in an hour pushes the same hour twice, and the
+  second is the duplicate it should be. Otherwise the rows are added to their day
+  (`addSlice`, `src/usage/runs.js`): `success`, `errors`, `noop`, `edits`, `ms` summed,
+  `maxMs` the greater, `hours` added hour by hour, a `name` given replacing the day's;
+  errors appended, the newest 5 per rule kept as before. `through` moves to the slice's
+  day when that is later; the card and the Usage tab still show days, never an hour.
+- A full push (no `mode`) still replaces its days and forgets the intervals of them, so a
+  slice of a replaced day that comes later is added on top of it. The receiver guarantees
+  no double counting of the same hour and nothing more: **do not mix** a daily full push
+  (Python, CI) and hourly slices (JMWE, ScriptRunner) on one site - the full push wins for
+  its days and the slices after it are added on top.
+- A slice drops the days past 35 (folded into their months on Advanced) as a full push
+  does, or a site fed by slices alone would keep every day for ever. The interval is taken
+  right after the rows and before the failures, so a write that stops later is retried into
+  a `covered` skip with the counts right; one that stops earlier is retried whole.
 
 ## 6c. Old senders keep working
 

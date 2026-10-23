@@ -339,6 +339,36 @@ and codes only: no work-item ids, no message text, no account ids.
 The days the window covers replace what the app had for them. Other days are kept, 35 days
 back.
 
+#### Slices: one hour at a time (`"mode": "slice"`)
+
+A sender that cannot read a whole busy day in one run pushes one clock hour instead, and
+the app adds the hour to its day rather than replacing the day:
+
+```json
+{"runs":{"mode":"slice","window":{"start":1791968400000,"end":1791972000000},
+  "rows":[{"uuid":"019dd4aa-…","day":"2026-10-14","success":2,"errors":1,"noop":0,"edits":0,
+           "ms":9000,"maxMs":4000,"hours":{"9":3}}],
+  "errors":[]},
+ "sender":{"name":"jmwe","version":"1.6.0"}}
+```
+
+| Field | Rule |
+|---|---|
+| `mode` | `slice`, or absent (the push of whole days above). Anything else is a `400` |
+| `window` | the half-open interval `[start, end)`, Unix ms: at most 24 hours, `end` after `start` and no later than 5 minutes past the app's clock, or the push is a `400`. Our senders push the previous full clock hour in UTC |
+| `rows[]` | as above, counting only the runs inside the window (`hours` has the slice's hours only). A slice aligned to the hour never crosses midnight; one that does carries a row per day |
+
+The rows are **added** to their day: `success`, `errors`, `noop`, `edits` and `ms` summed,
+`maxMs` the greater, `hours` added hour by hour, a `name` given replacing the day's; `errors`
+are appended, the newest 5 per rule kept. The app remembers the intervals it took for 35 days,
+and a slice that overlaps one is dropped by the write job - counted into nothing, its errors
+not kept. The answer is the same `202 queued` either way (it is given before the job runs),
+so a re-push of a covered hour is silently dropped: push the *previous* full hour, and a job
+that runs twice in an hour counts it once. A push of whole days (no `mode`) replaces its days
+and forgets the intervals of them, and a slice after it is added on top: **do not mix** daily
+full pushes and hourly slices on one site - the app guarantees no double counting of the same
+hour, nothing more.
+
 ## Answers
 
 Every answer is JSON from a fixed list. `error` names it; `detail` is a fixed sentence.
@@ -348,7 +378,7 @@ Every answer is JSON from a fixed list. `error` names it; `detail` is a fixed se
 | 200 | `alive` | `GET /v1`: the receiver is there | — |
 | 202 | `accepted` | the chunk is stored; or the last chunk of a part while other parts are still to come | send the next chunk (or the next part) |
 | 202 | `queued` | the last chunk proved the whole. Rules: build queued. Usage, runs: write queued, kept within a minute | done |
-| 400 | `bad-request` | a header missing or malformed (`X-Automap-Part` not `N/M` in range, or on usage or runs); seq 400 or more; empty or gzip body; usage or runs that is not JSON or not the right shape; a part that is not a rules document | fix the sender |
+| 400 | `bad-request` | a header missing or malformed (`X-Automap-Part` not `N/M` in range, or on usage or runs); seq 400 or more; empty or gzip body; usage or runs that is not JSON or not the right shape (a runs `mode` other than `slice`; a slice over 24 hours, empty, or ending in the future); a part that is not a rules document | fix the sender |
 | 401 | `unauthorized` | no key, wrong key, revoked key | stop; make a new key in the app |
 | 402 | `inactive` | the subscription on this site has ended | stop |
 | 403 | `disabled` | this installation does not take this push: sync not switched on, or the site is on Basic | stop; skip usage and runs too |
@@ -381,6 +411,7 @@ last chunk, the proof (`422`).
 | Rules pushes that build | Advanced: 5 in a rolling day, files and pushes alike (`429 allowance`) |
 | Usage rules | up to 10,000 a month (what Atlassian lists); Advanced keeps all |
 | Runs | window of at most 31 days; 100,000 rows (20,000 a day) and 500 errors per push; 35 days kept |
+| Runs slices | `mode: slice`: an interval of at most 24 hours, ending no later than 5 minutes past the app's clock; the intervals taken are remembered 35 days |
 
 ## Versions
 

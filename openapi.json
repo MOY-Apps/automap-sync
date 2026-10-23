@@ -37,8 +37,9 @@
     "runsMaxRulesPerDay": 20000,
     "runsMaxErrors": 500,
     "runsMaxWindowDays": 31,
+    "runsSliceMaxHours": 24,
     "runsKeepDays": 35,
-    "description": "maxChunkBytes: one request body, in UTF-8 bytes (413 above it). recommendedChunkBytes: what the published senders send; the platform fails bodies near 800 KB before the app runs. maxChunks: chunks in one run (X-Automap-Seq 0 to 399; 400 or more is a 400). rateLimit: requests per rateWindowSeconds for one installation's key, counted for every request whose key matches, refused ones included (429 rate-limited); the window is fixed, not rolling. maxFlows: Atlassian lists at most 10,000 rules a month and Advanced keeps every rule a usage push carries; 10,000 is the cap the app applies where a plan sets no figure. runsMaxRows: rows of one runs push that are kept; past it the push keeps its newest days whole and drops the oldest, and the window starts at the first day kept (those days are not replaced). runsMaxRulesPerDay: rows of one day that are kept, the rest of that day dropped. runsMaxErrors: errors of one push that are kept, the rest dropped. runsMaxWindowDays: a runs window longer than this is a 400. runsKeepDays: how many days of runs the app keeps."
+    "description": "maxChunkBytes: one request body, in UTF-8 bytes (413 above it). recommendedChunkBytes: what the published senders send; the platform fails bodies near 800 KB before the app runs. maxChunks: chunks in one run (X-Automap-Seq 0 to 399; 400 or more is a 400). rateLimit: requests per rateWindowSeconds for one installation's key, counted for every request whose key matches, refused ones included (429 rate-limited); the window is fixed, not rolling. maxFlows: Atlassian lists at most 10,000 rules a month and Advanced keeps every rule a usage push carries; 10,000 is the cap the app applies where a plan sets no figure. runsMaxRows: rows of one runs push that are kept; past it the push keeps its newest days whole and drops the oldest, and the window starts at the first day kept (those days are not replaced). runsMaxRulesPerDay: rows of one day that are kept, the rest of that day dropped. runsMaxErrors: errors of one push that are kept, the rest dropped. runsMaxWindowDays: a runs window longer than this is a 400. runsSliceMaxHours: a runs push with mode slice covers at most this many hours; longer, empty, or ending more than 5 minutes past the receiver's clock is a 400. runsKeepDays: how many days of runs the app keeps, and how long it remembers the hours slices covered."
   },
   "x-automap-plans": {
     "basic": { "push": false, "usage": false },
@@ -119,6 +120,10 @@
                   "summary": "X-Automap-Kind: usage",
                   "value": "{\"usage\":{\"period\":{\"start\":1790812800000,\"end\":1791990000000},\"steps\":{\"total\":1322,\"jira\":1322,\"other\":0},\"rovo\":{\"total\":0,\"jira\":0,\"other\":0},\"flows\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"name\":\"MARKET: Licenses create\",\"state\":\"ENABLED\",\"runs\":14,\"steps\":1303,\"rovo\":0,\"deleted\":false,\"agentic\":false}],\"billable\":{\"month\":\"2026-10\",\"rules\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"runs\":14}]},\"limits\":[{\"product\":\"JIRA_SERVICE_MANAGEMENT\",\"used\":18,\"limit\":3000,\"edition\":\"premium\"}],\"trend\":[{\"month\":\"2026-09\",\"runs\":{\"JIRA_SERVICE_MANAGEMENT\":1073}}],\"creditPack\":false}}"
                 },
+                "runs-slice": {
+                  "summary": "X-Automap-Kind: runs, one clock hour added to its day (mode: slice)",
+                  "value": "{\"runs\":{\"mode\":\"slice\",\"window\":{\"start\":1791968400000,\"end\":1791972000000},\"rows\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"day\":\"2026-10-14\",\"name\":\"MARKET: Licenses create\",\"success\":2,\"errors\":1,\"noop\":0,\"edits\":0,\"ms\":9000,\"maxMs\":4000,\"hours\":{\"9\":3}}],\"errors\":[]},\"sender\":{\"name\":\"jmwe\",\"version\":\"1.6.0\"}}"
+                },
                 "runs": {
                   "summary": "X-Automap-Kind: runs",
                   "value": "{\"runs\":{\"window\":{\"start\":1791331200000,\"end\":1791991583000},\"rows\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"day\":\"2026-10-13\",\"name\":\"MARKET: Licenses create\",\"success\":10,\"errors\":30,\"noop\":0,\"edits\":1,\"ms\":1200000,\"maxMs\":31000,\"hours\":{\"9\":12,\"14\":28}}],\"errors\":[{\"uuid\":\"019dd4aa-0000-7000-8000-000000000001\",\"componentId\":\"5ce09150-0000-4000-8000-000000000000\",\"componentType\":\"BRANCH\",\"type\":\"jira.smart.values.branch\",\"code\":\"com.codebarrel.automation.rule.error.smart.value.no.object\",\"at\":1791968400000}]}}"
@@ -141,7 +146,7 @@
             }
           },
           "400": {
-            "description": "Not a push. A header is missing or malformed (run id, seq, kind, a last chunk without a valid X-Automap-Sha256 or X-Automap-Length, an X-Automap-Part that is not N/M within 1 <= N <= M <= 20 or that is sent on usage or runs), seq is 400 or more, the body is empty or compressed. For a part also: the part proved whole is not a rules document (that part is dropped; the group stays). For usage and runs also: the joined document is not JSON, or not a usage / runs document (for example no `period`, or a runs window over 31 days). Fix the sender; sending the same request again will not help.",
+            "description": "Not a push. A header is missing or malformed (run id, seq, kind, a last chunk without a valid X-Automap-Sha256 or X-Automap-Length, an X-Automap-Part that is not N/M within 1 <= N <= M <= 20 or that is sent on usage or runs), seq is 400 or more, the body is empty or compressed. For a part also: the part proved whole is not a rules document (that part is dropped; the group stays). For usage and runs also: the joined document is not JSON, or not a usage / runs document (for example no `period`, a runs window over 31 days, a runs `mode` other than `slice`, or a slice over 24 hours, empty, or ending more than 5 minutes past the receiver's clock). Fix the sender; sending the same request again will not help.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -512,7 +517,7 @@
       },
       "RunsPayload": {
         "type": "object",
-        "description": "X-Automap-Kind: runs (beta, Advanced). The automation audit log of a window of whole UTC days, folded on your side into counts per rule and day, plus the failing component and error code of some failed runs. Counts and codes only: no work-item ids, no message text, no account ids. Fields not listed here are dropped. The days the window covers replace what the app had for them; other days are kept, 35 days back. No build, no load counted.",
+        "description": "X-Automap-Kind: runs (beta, Advanced). The automation audit log of a window of whole UTC days, folded on your side into counts per rule and day, plus the failing component and error code of some failed runs. Counts and codes only: no work-item ids, no message text, no account ids. Fields not listed here are dropped. The days the window covers replace what the app had for them; other days are kept, 35 days back. With `mode: slice` the window is one interval of at most 24 hours - our senders push the previous full clock hour - and its rows are added to their day instead; an interval overlapping one already taken is dropped by the write job, after the same `202 queued`. No build, no load counted.",
         "required": ["runs"],
         "properties": {
           "runs": { "$ref": "#/components/schemas/Runs" },
@@ -523,9 +528,14 @@
         "type": "object",
         "required": ["window"],
         "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["slice"],
+            "description": "Absent: the window's days are replaced by the rows (the push of whole days). `slice`: the window is a half-open interval [start, end) of at most 24 hours, ending no later than 5 minutes past the receiver's clock, and the rows - counting only the runs inside it - are ADDED to their day: success, errors, noop, edits and ms summed, maxMs the greater, hours added hour by hour, a name given replacing the day's; errors appended, the newest 5 per rule kept. The app remembers the intervals it took for 35 days and drops a slice that overlaps one (the sender is still answered 202 queued): push the previous full clock hour, and a job that runs twice in an hour counts it once. A full push (no mode) replaces its days and forgets the intervals of them, so do not mix daily full pushes and hourly slices on one site. Any other value is a 400."
+          },
           "window": {
             "type": "object",
-            "description": "Unix ms. Both above 0, end not before start, and at most 31 days apart, or the push is a 400.",
+            "description": "Unix ms. Both above 0, end not before start, and at most 31 days apart, or the push is a 400. With mode slice: [start, end), at most 24 hours, end after start and no later than 5 minutes past the receiver's clock.",
             "required": ["start", "end"],
             "properties": { "start": { "type": "integer", "minimum": 1 }, "end": { "type": "integer", "minimum": 1 } }
           },
