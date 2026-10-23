@@ -106,12 +106,41 @@ function usageAnswer(name, url, rules) {
  * head, as a busy site does while a sender pages - so a sender that does not send
  * `toTime` sees shifted pages. `fromTime` and `toTime` (ISO 8601 with milliseconds and Z)
  * are honoured; a malformed `toTime` is a 400.
+ *
+ * With `audit: { at, perHour }` the log is laid out by UTC hour around the instant `at`
+ * (Unix ms), for the hourly slices of senders 1.6.0: `perHour[0]` runs land in the hour
+ * `at` is in (before `at`), `perHour[1]` in the full hour before it, `perHour[2]` in the
+ * one before that, and so on. A full hour's runs sit on its first millisecond, its last
+ * and evenly between, so a window one millisecond off counts one too many or too few.
+ * The first run of the previous full hour failed (id 101, its detail readable above);
+ * the rest succeeded, the first two rules by turns.
  */
 function auditLog(rules, audit, state) {
   const [a, b] = rules;
   const now = Date.now();
   const records = [];
-  if (audit && audit.size) {
+  if (audit && audit.perHour) {
+    const HOUR = 3600000;
+    const top = audit.at - (audit.at % HOUR);
+    let id = 2000;
+    audit.perHour.forEach((n, i) => {
+      const start = top - i * HOUR;
+      for (let j = 0; j < n; j += 1) {
+        id += 1;
+        let t;
+        if (i === 0) t = start + 1000 * (j + 1);                       // the hour still running: a second apart
+        else if (j === 0) t = start;                                    // the hour's first millisecond
+        else if (j === n - 1) t = start + HOUR - 1;                     // and its last
+        else t = start + Math.floor((j * HOUR) / (n - 1));
+        if (t >= audit.at) throw new Error(`fake audit log: perHour[0] must fit before \`at\` (${n} runs, a second apart)`);
+        const failed = i === 1 && j === 0;
+        const r = j % 2 ? b : a;
+        records.push({ id: failed ? 101 : id, ruleIdUuid: r.uuid, ruleName: r.name, category: failed ? 'SOME_ERRORS' : 'SUCCESS',
+          eventTimestamp: t, durationMs: failed ? 31000 : 100, ...(failed ? { associatedIds: ['10042'] } : {}) });
+      }
+    });
+    records.sort((x, y) => y.eventTimestamp - x.eventTimestamp);
+  } else if (audit && audit.size) {
     // the newest two seconds back: a sender's clock may stamp whole seconds (bash)
     for (let i = 0; i < audit.size; i += 1) {
       const r = i % 2 ? b : a;
@@ -148,6 +177,42 @@ function auditLog(rules, audit, state) {
   };
 }
 
+const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+/**
+ * The runs (beta) kept the way the receiver keeps them. Without `mode` (senders up to
+ * 1.5.0) the push replaces the UTC days its window covers. With `mode: "slice"` (1.6.0)
+ * it is one hour of runs, half-open `[start, end)`: an hour already covered by an earlier
+ * slice - the same job run twice, two copies of it - is dropped silently, `queued` to the
+ * sender and `skipped` in `runsLog`; otherwise its counts are added to the day rows.
+ * Any other `mode` is not a runs document: false, and the push is a 400.
+ */
+function keepRuns(state, runs) {
+  const w = runs && runs.window ? runs.window : {};
+  const rows = Array.isArray(runs && runs.rows) ? runs.rows : [];
+  const add = (row, replace) => {
+    const key = `${row.uuid}|${row.day}`;
+    const was = (!replace && state.days.get(key)) || { uuid: row.uuid, day: row.day, name: row.name, success: 0, errors: 0, noop: 0, edits: 0 };
+    for (const k of ['success', 'errors', 'noop', 'edits']) was[k] += Number(row[k]) || 0;
+    state.days.set(key, was);
+  };
+  if (runs.mode === undefined) {
+    for (const [key, row] of state.days) if (row.day >= dayOf(w.start) && row.day <= dayOf(w.end)) state.days.delete(key);
+    for (const row of rows) add(row, false);
+    state.runsLog.push({ mode: 'days', window: w, outcome: 'stored', rows: rows.length });
+    return true;
+  }
+  if (runs.mode !== 'slice' || !(w.end > w.start)) return false;
+  if (state.covered.some(([s, e]) => w.start < e && w.end > s)) {
+    state.runsLog.push({ mode: 'slice', window: w, outcome: 'skipped', rows: rows.length });
+    return true;
+  }
+  state.covered.push([w.start, w.end]);
+  for (const row of rows) add(row, false);
+  state.runsLog.push({ mode: 'slice', window: w, outcome: 'stored', rows: rows.length });
+  return true;
+}
+
 /**
  * @param rules        what the API holds (read live: a rule removed from the array is gone)
  * @param pageSize     summaries per page (small, so paging is exercised)
@@ -158,7 +223,7 @@ function auditLog(rules, audit, state) {
  * @param internalFlaky once each: creditUsage 500, auditlog 429 with Retry-After, auditlog/item/101 500
  * @param lose         'rules' | 'usage' | 'runs': the answer to the last chunk of the first push of
  *                     that kind is lost - the receiver takes the chunk, the sender hears nothing
- * @param audit        { size, grow }: the audit log's shape, see auditLog()
+ * @param audit        { size, grow } or { at, perHour }: the audit log's shape, see auditLog()
  * @param missing      the uuid of a rule whose detail answers 404 (listed, not readable)
  * @param garbage      the rule list answers 200 with a body that is not JSON
  */
@@ -177,6 +242,12 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
     pushRequests: 0,
     lost: 0,
     internalTrips: [],
+    // the runs (beta) as the receiver keeps them: one row per rule and UTC day with the
+    // counts merged, the hours a slice push covered (senders 1.6.0), and what each runs
+    // push did - `stored`, or `skipped` for a slice over an hour already covered
+    days: new Map(),
+    covered: [],
+    runsLog: [],
   };
   let tripped429 = false;
   let tripped500 = false;
@@ -309,7 +380,9 @@ export function startFakeSite({ rules = makeRules(), pageSize = 3, refuse = null
         state.extra.delete(key);
         if (sum && createHash('sha256').update(whole).digest('hex') !== sum) return answer('checksum');
         if (lengthText && whole.toString('utf8').length !== Number(lengthText)) return answer('checksum');
-        state.pushed[kind].push(JSON.parse(whole.toString('utf8')));
+        const doc = JSON.parse(whole.toString('utf8'));
+        state.pushed[kind].push(doc);
+        if (kind === 'runs' && !keepRuns(state, doc.runs)) return answer('bad-request');
         return answer('queued');
       }
 

@@ -63,8 +63,11 @@ fails, the rules are pushed anyway and the run still succeeds. `AUTOMAP_USAGE=of
 `RUNS`. Inside Jira they are a job of their own (`AutomapUsage.groovy`, `automap-usage.njk`),
 so the rules job keeps the host's whole time limit. ScriptRunner reads the audit log only while its run has time left, and JMWE reads
 at most `RUNS_MAX_PAGES` pages of it: past that the runs are skipped, not sent in part, and
-`AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix. Inside Jira the default is 1 (yesterday and today)
-and the usage job runs every hour: each run is short, and the map keeps 35 days of what they bring.
+`AUTOMAP_RUNS_DAYS` (JMWE: `RUNS_DAYS`) lower is the fix. Inside Jira the usage job runs every hour and,
+from ScriptRunner and JMWE 1.6.0, each run pushes the previous full UTC hour as a slice the map adds to the
+day and takes once (`AUTOMAP_RUNS_MODE` / `RUNS_MODE` = `slice`, the default; `days` is the earlier
+behaviour, `AUTOMAP_RUNS_DAYS` whole days, 1 = yesterday and today). An hour the job missed stays out,
+so run one copy, every hour. The map keeps 35 days of what they bring.
 
 ## Exit codes
 

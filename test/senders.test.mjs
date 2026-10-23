@@ -19,6 +19,9 @@ const has = (cmd, args = ['--version']) => spawnSync(cmd, args, { stdio: 'ignore
 const dockerUp = spawnSync('docker', ['info'], { stdio: 'ignore', timeout: 10_000 }).status === 0
   && spawnSync('docker', ['run', '--rm', 'alpine:3', 'true'], { stdio: 'ignore', timeout: 20_000, killSignal: 'SIGKILL' }).status === 0;
 const PLATFORM = ['--platform', process.arch === 'arm64' ? 'linux/arm64' : 'linux/amd64'];
+// GROOVY_GRAPES: a host folder mounted as the Groovy container's Grape cache, so unirest is
+// fetched once, not by every container - Maven Central answers 429 to a burst of them
+const GRAPES = process.env.GROOVY_GRAPES ? ['-v', `${process.env.GROOVY_GRAPES}:/home/groovy/.groovy/grapes`] : [];
 
 /** The version a sender announces, read from its own file so a release never has to touch this test. */
 const FILES = {
@@ -51,7 +54,7 @@ const SENDERS = [
     local: has('groovy'),
     run: (e, envv, local, file = 'AutomapSync.groovy') => (local
       ? ['groovy', [join(root, 'scriptrunner/test/run-locally.groovy'), join(root, 'scriptrunner', file)]]
-      : ['docker', ['run', '--rm', '-v', `${root}:/s:ro`, ...dockerEnv(envv), ...PLATFORM,
+      : ['docker', ['run', '--rm', '-v', `${root}:/s:ro`, ...GRAPES, ...dockerEnv(envv), ...PLATFORM,
         'groovy:4.0-jdk17', 'groovy', '/s/scriptrunner/test/run-locally.groovy', `/s/scriptrunner/${file}`]]),
     dryRunByEnv: true,
     // two Scheduled Jobs: the rules, and the usage and runs (beta), each with the whole time limit
@@ -209,7 +212,8 @@ for (const s of SENDERS) {
   test(`${s.name}: the audit log is read up to the instant the window ends, so runs landing meanwhile shift no page`, opts, async () => {
     const site = await startFakeSite({ rules: makeRules(3), host, flaky: false, audit: { size: 130, grow: 7 } });
     try {
-      const { code, out } = s.usageFile ? await runSender(s, site, {}, [], s.usageFile) : await runSender(s, site);
+      // the in-Jira usage job pushes hourly slices from 1.6.0; whole days are its `days` mode
+      const { code, out } = s.usageFile ? await runSender(s, site, { AUTOMAP_RUNS_MODE: 'days' }, [], s.usageFile) : await runSender(s, site);
       assert.equal(code, 0, out);
       assert.equal(site.state.pushed.runs.length, 1, out);
       const r = site.state.pushed.runs[0].runs;
@@ -295,10 +299,11 @@ for (const s of SENDERS) {
   const host = !s.ok && !s.local ? 'host.docker.internal' : '127.0.0.1';
   test(`${s.name}: usage and runs (beta) are pushed apart from the rules, without ids, and never fail the run`, { skip: available ? false : `${s.name}: runtime not available`, timeout: 360_000 }, async () => {
   // a sender split in two (ScriptRunner) runs its usage script after the rules one, as two jobs would
+  // (whole days, as before 1.6.0: the usage job's default became hourly slices, tested below)
   const runBoth = async (site2, extra = {}) => {
     const first = await runSender(s, site2, extra);
     if (!s.usageFile) return first;
-    const second = await runSender(s, site2, extra, [], s.usageFile);
+    const second = await runSender(s, site2, { AUTOMAP_RUNS_MODE: 'days', ...extra }, [], s.usageFile);
     return { code: first.code || second.code, out: first.out + second.out };
   };
   const rules = makeRules(3);
@@ -371,6 +376,90 @@ for (const s of SENDERS) {
     await lost.close();
   }
 });
+
+  test(`${s.name}: the usage job pushes the previous full UTC hour as a slice; the same hour again is dropped; RUNS_MODE=days is the old shape`, { timeout: 600_000, skip: !s.usageFile ? `${s.name}: reads whole days, no slices` : available ? false : `${s.name}: runtime not available` }, async () => {
+    const site = await startFakeSite({ rules: makeRules(3), host, flaky: false, audit: { at: SLICE_AT, perHour: PER_HOUR } });
+    try {
+      const run = (extra) => runSender(s, site, extra, [], s.usageFile);
+      await checkSlices(run, site, (r) => assert.equal(r.code, 0, r.out));
+      // a bad mode is a configuration failure, found before anything is read
+      const calls = site.state.usageCalls;
+      const bad = await run({ AUTOMAP_NOW_MS: String(SLICE_AT), AUTOMAP_RUNS_MODE: 'hourly' });
+      assert.equal(bad.code, 2, bad.out);
+      assert.match(bad.out, /AUTOMAP_RUNS_MODE must be slice or days, not hourly/);
+      assert.equal(site.state.usageCalls, calls, 'nothing read');
+    } finally {
+      await site.close();
+    }
+  });
+}
+
+/**
+ * The hourly slices of the in-Jira usage jobs (1.6.0): with its clock fixed at SLICE_AT
+ * (10:05 UTC) and the fake's log laid out by hour, the job pushes exactly the previous
+ * full hour, 09:00-10:00, as `mode: "slice"`; the same job again is `queued` but dropped;
+ * the hour after adds; `days` is the shape of 1.5.0 to the byte, apart from the version.
+ */
+const SLICE_AT = Date.UTC(2026, 9, 23, 10, 5, 0, 0);
+const PER_HOUR = [3, 7, 5, 4];     // 10:00-10:05, 09:00-10:00, 08:00-09:00, 07:00-08:00
+const ISO = (ms) => new Date(ms).toISOString();
+const runsOf = (rows) => rows.reduce((n, x) => n + x.success + x.errors + x.noop, 0);
+async function checkSlices(run, site, okay) {
+  const H = 3600000;
+  const at = SLICE_AT;
+  const start = at - (at % H) - H;
+  const end = start + H;
+  const first = await run({ AUTOMAP_NOW_MS: String(at) });
+  okay(first);
+  // usage untouched
+  const u = site.state.pushed.usage[site.state.pushed.usage.length - 1].usage;
+  assert.equal(u.steps.total, 1310);
+  assert.match(first.out, /usage \(beta\) 2026-10: pushed 1310 steps for 2 rules/);
+  // the slice: the previous full hour, half-open, every run of it once
+  assert.equal(site.state.pushed.runs.length, 1, first.out);
+  const doc = site.state.pushed.runs[0];
+  assert.equal(doc.runs.mode, 'slice');
+  assert.deepEqual(doc.runs.window, { start, end });
+  assert.equal(ISO(start), '2026-10-23T09:00:00.000Z');
+  assert.equal(runsOf(doc.runs.rows), PER_HOUR[1], JSON.stringify(doc.runs.rows));
+  assert.ok(doc.runs.rows.every((x) => x.day === '2026-10-23'));
+  assert.equal(doc.runs.rows.reduce((n, x) => n + x.errors, 0), 1);
+  assert.deepEqual(doc.runs.errors.map((e) => [e.componentId, e.code]), [['c-branch', 'com.codebarrel.automation.rule.error.smart.value.no.object']]);
+  assert.ok(site.state.audit.calls.length >= 1);
+  for (const c of site.state.audit.calls) assert.deepEqual([c.fromTime, c.toTime], [ISO(start), ISO(end)], JSON.stringify(c));
+  assert.match(first.out, /runs \(beta\) slice 09:00\u201310:00 UTC: pushed 7 runs, 1 with errors/);
+  assert.deepEqual(site.state.runsLog.map((l) => l.outcome), ['stored']);
+  assert.equal(runsOf([...site.state.days.values()]), PER_HOUR[1]);
+
+  // the same job again in the same hour (a second copy, a retry): dropped by the receiver, silently
+  const again = await run({ AUTOMAP_NOW_MS: String(at + 600000) });
+  okay(again);
+  assert.deepEqual(site.state.runsLog.map((l) => l.outcome), ['stored', 'skipped']);
+  assert.equal(runsOf([...site.state.days.values()]), PER_HOUR[1], 'counts unchanged');
+  assert.match(again.out, /runs \(beta\) slice 09:00\u201310:00 UTC: pushed 7 runs, 1 with errors/);
+  assert.doesNotMatch(again.out, /duplicate|already|skipped/);
+
+  // an hour later: the next hour, added to the day
+  const next = await run({ AUTOMAP_NOW_MS: String(at + H) });
+  okay(next);
+  const d2 = site.state.pushed.runs[2];
+  assert.deepEqual(d2.runs.window, { start: end, end: end + H });
+  assert.equal(runsOf(d2.runs.rows), PER_HOUR[0]);
+  assert.match(next.out, /runs \(beta\) slice 10:00\u201311:00 UTC: pushed 3 runs, 0 with errors/);
+  assert.deepEqual(site.state.runsLog.map((l) => l.outcome), ['stored', 'skipped', 'stored']);
+  assert.equal(runsOf([...site.state.days.values()]), PER_HOUR[0] + PER_HOUR[1]);
+
+  // RUNS_MODE=days: yesterday and today, the document of 1.5.0 - no `mode`, the same keys in the same order
+  const days = await run({ AUTOMAP_NOW_MS: String(at), AUTOMAP_RUNS_MODE: 'days' });
+  okay(days);
+  const d3 = site.state.pushed.runs[3];
+  assert.deepEqual(Object.keys(d3), ['runs', 'sender']);
+  assert.deepEqual(Object.keys(d3.runs), ['window', 'rows', 'errors']);
+  assert.deepEqual(d3.runs.window, { start: Date.UTC(2026, 9, 22), end: at });
+  assert.equal(runsOf(d3.runs.rows), PER_HOUR.reduce((n, x) => n + x, 0));
+  assert.match(days.out, /runs \(beta\) yesterday and today: pushed 19 runs, 1 with errors/);
+  assert.equal(site.state.runsLog[3].outcome, 'stored');
+  assert.equal(runsOf([...site.state.days.values()]), 19, 'whole days replace what the slices brought');
 }
 
 /** The part a rule belongs to: its uuid's first 8 hex digits as a number, mod M, plus 1. */
@@ -405,7 +494,8 @@ test('jmwe: rules, usage and runs (beta), apart from each other, without ids, ne
     assert.deepEqual(site.state.loaded[0].rules, expectedRules(rules));
     assert.ok(site.state.answers.includes('failed'), 'the 500 was met and retried');
     assert.equal(site.state.usageCalls, 0, 'the rules template leaves usage and runs to the other one');
-    const { code, out } = await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk' });
+    // whole days, as before 1.6.0: the usage template's default became hourly slices, tested below
+    const { code, out } = await runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk', AUTOMAP_RUNS_MODE: 'days' });
     assert.equal(code, 0, out);
     assert.deepEqual(site.state.internalTrips, ['creditUsage', 'auditlog', 'auditlog/item/101'], 'each refusal retried');
     assert.equal(site.state.loaded.length, 1, 'the usage template pushes no rules');
@@ -489,7 +579,7 @@ test('jmwe: a lost answer to the last chunk is not a second push; a lost chunk i
     assert.equal(parts.state.loaded.length, 1, two.out);
     assert.deepEqual(new Set(uuidsOf(parts.state.loaded[0])), new Set(makeRules(7).map((r) => r.uuid)));
 
-    const grew = await runJmwe(growing, { JMWE_TEMPLATE: 'automap-usage.njk' });
+    const grew = await runJmwe(growing, { JMWE_TEMPLATE: 'automap-usage.njk', AUTOMAP_RUNS_MODE: 'days' });
     assert.equal(grew.code, 0, grew.out);
     const r = growing.state.pushed.runs[0].runs;
     assert.ok(growing.state.audit.calls.length >= 3);
@@ -578,6 +668,21 @@ test('jmwe: PART "1/2" then "2/2" push two slices of one day\'s run, and the map
     } finally {
       await shrinking.close();
     }
+  } finally {
+    await site.close();
+  }
+});
+
+test('jmwe: the usage template pushes the previous full UTC hour as a slice; the same hour again is dropped; RUNS_MODE=days is the old shape', { skip: nunjucksDir ? false : 'jmwe: set NUNJUCKS_DIR to a folder with nunjucks installed', timeout: 240_000 }, async () => {
+  const site = await startFakeSite({ rules: makeRules(3), flaky: false, audit: { at: SLICE_AT, perHour: PER_HOUR } });
+  try {
+    const run = (extra) => runJmwe(site, { JMWE_TEMPLATE: 'automap-usage.njk', ...extra });
+    await checkSlices(run, site, (r) => assert.equal(r.code, 0, r.out));
+    // a bad mode is a configuration failure, found before anything is read
+    const calls = site.state.usageCalls;
+    const bad = await run({ AUTOMAP_NOW_MS: String(SLICE_AT), AUTOMAP_RUNS_MODE: 'hourly' });
+    assert.match(bad.out, new RegExp(`^automap-sync jmwe ${versionOf('jmwe').replace(/\./g, '\\.')} usage: failed - \\[2\\] RUNS_MODE must be "slice" or "days", not "hourly"`), bad.out);
+    assert.equal(site.state.usageCalls, calls, 'nothing read');
   } finally {
     await site.close();
   }

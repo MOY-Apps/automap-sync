@@ -65,7 +65,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.5.0'
+final String VERSION = '1.6.0'
 final Set<Integer> REFUSED = [400, 401, 402, 403, 404, 405, 413, 426] as Set
 
 

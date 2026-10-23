@@ -4,28 +4,41 @@
  * of its own, next to AutomapSync.groovy, which pushes the rules.
  *
  * Reads, with the same Script Variables as AutomapSync.groovy, this month's steps, Rovo
- * credits and flow runs per rule, and the audit log of the last AUTOMAP_RUNS_DAYS days
- * folded into per-rule, per-day counts, from the internal API behind Jira's Usage and Audit
- * log tabs, and pushes them as two separate pushes. That API is undocumented and can
- * change: a failure there is logged and never fails the job. No account ids, no issue ids
- * and no message text leave the job. A usage push spends no load of the map, so schedule
- * this job every hour: each run reads only yesterday and today, which fits ScriptRunner's
- * time limit on any site, and the map keeps 35 days of what the runs bring.
+ * credits and flow runs per rule, and the audit log of the previous full UTC hour folded
+ * into per-rule, per-day counts, from the internal API behind Jira's Usage and Audit log
+ * tabs, and pushes them as two separate pushes. That API is undocumented and can change: a
+ * failure there is logged and never fails the job. No account ids, no issue ids and no
+ * message text leave the job. A usage push spends no load of the map, so schedule this job
+ * every hour: each run reads one hour of the log, which fits ScriptRunner's time limit on
+ * any site, and the map keeps 35 days of what the runs bring.
+ *
+ * The runs go as hourly SLICES (1.6.0): a run started at 10:05 reads 09:00:00.000 up to
+ * (not including) 10:00:00.000 UTC and pushes it as one slice; the map adds it to the day
+ * and takes each hour once, so the same hour pushed again changes nothing. The hour is cut
+ * by the clock, not by what was pushed before: a run that did not happen (ScriptRunner
+ * paused, the job disabled for a while) leaves its hour out of the map. Schedule the job
+ * every hour, and run ONE copy of it.
  *
  * SETUP: the Script Variables of AutomapSync.groovy, nothing more. Script Console: Run to
  * try it (AUTOMAP_DRY_RUN = 1 reads and sends nothing); then Scheduled Jobs -> Create, run as
  * a Jira administrator, every hour, and paste this script.
  *
- * Rarely needed: AUTOMAP_USAGE = off, AUTOMAP_RUNS = off, AUTOMAP_RUNS_DAYS (1: yesterday and
- * today; more days only for a one-off backfill),
- * ATLASSIAN_CLOUD_ID.
+ * Rarely needed: AUTOMAP_USAGE = off, AUTOMAP_RUNS = off, AUTOMAP_RUNS_MODE = days (the
+ * behaviour before 1.6.0: whole days, the last AUTOMAP_RUNS_DAYS of them - 1 is yesterday
+ * and today - each push replacing those days on the map; for a one-off backfill, then back
+ * to slice), ATLASSIAN_CLOUD_ID.
  *
  * Limits: the audit log is read only while the run has time left (200 s); if it does not
- * fit, the runs are skipped, not sent in part - set AUTOMAP_RUNS_DAYS lower.
+ * fit, the runs are skipped, not sent in part - a partial slice would count as the whole
+ * hour. An hour is a few pages and never gets there; in days mode set AUTOMAP_RUNS_DAYS lower.
  *
  * From 1.5.0: the internal API is retried like the Automation API, honouring Retry-After;
  * the audit log is read up to the instant the window ends (toTime); a 409 to a last chunk
  * sent again (its first answer lost) means the receiver took the first copy.
+ * From 1.6.0: the runs as hourly slices (mode "slice" in the document), AUTOMAP_RUNS_MODE.
+ *
+ * Tests only: AUTOMAP_NOW_MS (Unix ms) stops the clock at that instant, so a test can
+ * place the slice. Do not set it on a site.
  *
  * Copyright MOY Apps. Licensed for use with Automation Map for Jira only; see LICENSE.
  */
@@ -34,7 +47,7 @@ import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 final String NAME = 'scriptrunner'
-final String VERSION = '1.5.0'
+final String VERSION = '1.6.0'
 final long STARTED = System.currentTimeMillis()
 // ScriptRunner Cloud stops a script after a few minutes; the runs (beta) are read only
 // while there is time left, and skipped rather than sent in part when there is not
@@ -63,6 +76,12 @@ def say = { String m ->
 
 
 boolean dryRun = lookup('AUTOMAP_DRY_RUN')?.toString() == '1'
+// the clock: now, or the instant a test stopped it at (AUTOMAP_NOW_MS, never on a site)
+String nowOverride = lookup('AUTOMAP_NOW_MS')?.toString()
+final long NOW_MS = nowOverride?.isLong() ? nowOverride.toLong() : System.currentTimeMillis()
+// the runs (beta) as hourly slices (the default from 1.6.0) or as whole days (AUTOMAP_RUNS_DAYS)
+String runsMode = lookup('AUTOMAP_RUNS_MODE')?.toString()?.toLowerCase() ?: 'slice'
+if (!(runsMode in ['slice', 'days'])) throw new IllegalStateException("[2] AUTOMAP_RUNS_MODE must be slice or days, not ${runsMode}")
 String auth = 'Basic ' + "${cfg('ATLASSIAN_EMAIL')}:${cfg('ATLASSIAN_API_TOKEN')}".bytes.encodeBase64().toString()
 String api = cfg('ATLASSIAN_API_BASE', 'https://api.atlassian.com').replaceAll('/$', '')
 
@@ -168,7 +187,8 @@ def pushUsage = { ->
   if (off) return
   try {
     def now = Calendar.getInstance(TimeZone.getTimeZone('UTC'))
-    long nowMs = now.timeInMillis
+    now.timeInMillis = NOW_MS
+    long nowMs = NOW_MS
     def first = Calendar.getInstance(TimeZone.getTimeZone('UTC'))
     first.clear(); first.set(now.get(Calendar.YEAR), now.get(Calendar.MONTH), 1)
     def label = { Calendar c -> String.format('%04d-%02d', c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1) }
@@ -232,13 +252,26 @@ def pushRuns = { ->
   if (runsOff) return
   if (shut[0]) { say('runs (beta) skipped: the map does not take them (403)'); return }
   try {
-    // yesterday and today: an hourly job keeps the map's 35 days filled without a long run
+    boolean slice = runsMode == 'slice'
     int days = 1
-    String d = lookup('AUTOMAP_RUNS_DAYS')?.toString()
-    if (d?.isInteger()) days = Math.max(1, Math.min(30, d.toInteger()))
-    long nowMs = System.currentTimeMillis()
-    long start = nowMs - days * 86400000L
-    start -= start % 86400000L          // whole days, so a day pushed is a day complete
+    long nowMs = NOW_MS
+    long start, end
+    String span
+    if (slice) {
+      // the previous full UTC hour, half-open [start, end): at 10:05, 09:00:00.000 to 10:00:00.000
+      end = nowMs - nowMs % 3600000L
+      start = end - 3600000L
+      def hhmm = { long ms -> String.format('%02d:00', (int) ((ms % 86400000L) / 3600000L)) }
+      span = "slice ${hhmm(start)}\u2013${hhmm(end)} UTC".toString()
+    } else {
+      // whole days (the behaviour before 1.6.0): yesterday and today, or AUTOMAP_RUNS_DAYS of them
+      String d = lookup('AUTOMAP_RUNS_DAYS')?.toString()
+      if (d?.isInteger()) days = Math.max(1, Math.min(30, d.toInteger()))
+      start = nowMs - days * 86400000L
+      start -= start % 86400000L          // whole days, so a day pushed is a day complete
+      end = nowMs
+      span = days == 1 ? 'yesterday and today' : "last ${days} days"
+    }
     // the log is newest first and paged by offset: runs landing while it is read would
     // shift every page, so the read ends at the instant the window does (toTime)
     def fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
@@ -247,18 +280,23 @@ def pushRuns = { ->
     List records = []
     for (int offset = 0; offset < 50000; offset += 50) {   // 50 a page whatever is asked; `total` is always 0
       if (System.currentTimeMillis() - STARTED > BUDGET_MS) {
-        throw new IllegalStateException("the audit log of ${days} days did not fit in this run; set AUTOMAP_RUNS_DAYS lower")
+        // never a part of it: a partial slice would count as the whole hour
+        throw new IllegalStateException(slice
+          ? "the audit log of ${span} did not fit in this run; that hour is left out"
+          : "the audit log of ${days} days did not fit in this run; set AUTOMAP_RUNS_DAYS lower")
       }
-      def page = internalCall('auditlog', [fromTime: fmt.format(new Date(start)), toTime: fmt.format(new Date(nowMs)), offset: offset, limit: 50])?.items?.items ?: []
+      def page = internalCall('auditlog', [fromTime: fmt.format(new Date(start)), toTime: fmt.format(new Date(end)), offset: offset, limit: 50])?.items?.items ?: []
       records.addAll(page)
       if (page.size() < 50) break
+      // newest first: a page reaching past the window's start is the last one worth reading
+      if (slice && page.any { (it.eventTimestamp ?: it.startTime ?: end) < start }) break
     }
     Map rows = [:]
     Map failed = [:]
     records.each { r ->
       String u = r.ruleIdUuid
       def t = r.eventTimestamp ?: r.startTime
-      if (!u || !t || t < start) return
+      if (!u || !t || t < start || (slice && t >= end)) return
       long tm = t as long
       String day = dayOf(tm)
       String k = u + '|' + day
@@ -299,12 +337,13 @@ def pushRuns = { ->
         }
       }
     }
-    Map runs = [window: [start: start, end: nowMs], rows: rows.values() as List, errors: errors]
+    // a slice says so (mode); whole days are the document of 1.5.0, unchanged
+    Map runs = slice ? [mode: 'slice'] : [:]
+    runs << [window: [start: start, end: end], rows: rows.values() as List, errors: errors]
     Map doc = [runs: runs, sender: [name: NAME, version: VERSION]]
     String text = asciiJson(doc)
     int total = runs.rows.sum(0) { it.success + it.errors + it.noop }
     int bad = runs.rows.sum(0) { it.errors }
-    String span = days == 1 ? 'yesterday and today' : "last ${days} days"
     if (dryRun) { say("runs (beta) ${span}: ${total} runs, ${bad} with errors; nothing pushed"); return }
     def r = pushKind('runs', text)
     if (r.status == 202) say("runs (beta) ${span}: pushed ${total} runs, ${bad} with errors")
