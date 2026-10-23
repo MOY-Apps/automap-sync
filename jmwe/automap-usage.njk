@@ -29,7 +29,9 @@
   days mode RUNS_DAYS lower is the fix.
 
   Every request is tried up to three times when it gets no answer (a timeout), a 429 or
-  a 5xx - at once, since a template cannot wait. The audit log is read up to the instant
+  a 5xx - at once, since a template cannot wait. A real 429 (the receiver's window of 500
+  requests in 10 minutes used up) lasts minutes, so the three tries can go in a second
+  and the job then fails for that run; the next scheduled run pushes again. The audit log is read up to the instant
   the window ends (toTime), so runs landing meanwhile shift no page. A 409 to a last
   chunk sent again means the receiver took the first copy and its answer was lost: the
   push is done.
