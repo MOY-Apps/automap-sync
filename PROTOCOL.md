@@ -186,21 +186,27 @@ document the build reads, and builds once.
   part clears that part - a resent part replaces itself. The group's `builds` row,
   `push-<run>`, is opened by whichever part's chunk 0 comes first, and the load allowance is
   checked there once: the parts are **one load**. A part for a group whose build is already
-  queued is `409 conflict`, as a reused run is. Each proven part has a mark of its own
-  (`push_part:<run>:<n>`), and when a last chunk finds every mark in place it claims the
-  merge with one conditional update of the group's row (`stage = 'merge'`): two parts
-  finishing in the same instant both see every mark, exactly one wins the row and builds,
-  the other answers `accepted`.
+  queued is `409 conflict`, as a reused run is. The group has a key of its own
+  (`push_group:<run>`) and each proven part a mark of its own (`push_part:<run>:<n>`),
+  and when a last chunk finds every mark in place it claims the merge with one conditional
+  update of the group's row (`stage = 'merge'`): two parts finishing in the same instant
+  both see every mark, exactly one wins the row and queues the merge, the other answers
+  `accepted`. A group being merged takes no chunk (`409`) until its build is queued.
 - **Answers.** The last chunk of a part is `202 accepted` while parts are missing, and
   `202 queued` when it completed the group. Parts may come in any order. A part whose proof
   fails is `422 checksum` and that part alone is dropped - the group and its other parts
   stay, and the sender sends the part again from chunk 0; the build is not failed.
-- **The merge**, when the last missing part is in: the rules of every part in part order, a
-  rule carried by two parts kept once (the later part's copy - the job that ran later read
-  the newer rule; by `uuid`, or `id` without one), `sender` from the part that completed the
-  group, and `"parts": M` added. The document is written compact and ASCII under
-  `push-<run>` in chunks of 200 KB, the parts' chunks go, and the build is queued exactly
-  as for a plain push. The settings page says "in M parts".
+- **The merge**, when the last missing part is in, runs on the app's queue, not in the
+  request (a web trigger has 25 seconds; reading and writing a large site's parts is more):
+  the rules of every part in part order, a rule carried by two parts kept once (the later
+  part's copy - the job that ran later read the newer rule; by `uuid`, or `id` without
+  one), `sender` from the part that completed the group, and `"parts": M` added. The
+  document is written compact and ASCII under `push-<run>` in chunks of 200 KB, the parts'
+  chunks go, and the build is queued exactly as for a plain push. The settings page says
+  "merging them now" in between, then "in M parts". A merge the database let fail is tried
+  three times; after that the row is open again, every part still in, and running any one
+  job again (its last chunk completes the group once more) starts the merge over - the
+  page says so.
 - **24 hours.** A group still open a day after it began was abandoned (the other job
   never came). Whatever looks first - any part push, or the settings page - drops its
   parts' chunks and marks, fails its build row ("Not every part of this push arrived
