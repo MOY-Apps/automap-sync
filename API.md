@@ -65,7 +65,7 @@ load.
 - You send the chunks **in order, one at a time**, as `POST <receiver-url>`. All chunks of
   one push share a **run id**. The last chunk says it is the last and carries the proof.
 - The receiver joins the chunks and checks the proof. Rules then go to a build: the map
-  rebuilds in a minute or two. Usage and runs are kept at once.
+  rebuilds in a minute or two. Usage and runs are written by the same queue, within a minute.
 - Every answer is one of a fixed set of bodies. The receiver never returns your data,
   counts or error text. Read the **status code**. What happened after the push (loaded,
   refused as another site's) is on the app's settings page.
@@ -323,7 +323,7 @@ and codes only: no work-item ids, no message text, no account ids.
 | Field | Rule |
 |---|---|
 | `window.start`, `window.end` | Unix ms, end not before start, at most 31 days apart. Otherwise the push is a `400` |
-| `rows[]` | one per rule and UTC day (`day` is `YYYY-MM-DD`). `success`, `errors`, `noop` (did nothing), `edits` (rule edits, not runs), `ms` (total time), `maxMs` (longest run). First 20,000 kept |
+| `rows[]` | one per rule and UTC day (`day` is `YYYY-MM-DD`). `success`, `errors`, `noop` (did nothing), `edits` (rule edits, not runs), `ms` (total time), `maxMs` (longest run). At most 20,000 rows a day and 100,000 a push: past the push cap the newest days are kept whole, the oldest dropped, and the window starts at the first day kept |
 | `rows[].hours` | optional, sparse: runs per UTC hour, keys `0` to `23`, only hours that had any |
 | `errors[]` | failed components of failed runs: `uuid` (the rule; an entry without one is dropped), `componentId`, `componentType`, `type`, `code` (the error's i18n key or code), `at` (Unix ms). First 500 kept; the app keeps the 5 newest per rule |
 
@@ -338,7 +338,7 @@ Every answer is JSON from a fixed list. `error` names it; `detail` is a fixed se
 |---|---|---|---|
 | 200 | `alive` | `GET /v1`: the receiver is there | — |
 | 202 | `accepted` | the chunk is stored; or the last chunk of a part while other parts are still to come | send the next chunk (or the next part) |
-| 202 | `queued` | the last chunk proved the whole. Rules: build queued. Usage, runs: kept | done |
+| 202 | `queued` | the last chunk proved the whole. Rules: build queued. Usage, runs: write queued, kept within a minute | done |
 | 400 | `bad-request` | a header missing or malformed (`X-Automap-Part` not `N/M` in range, or on usage or runs); seq 400 or more; empty or gzip body; usage or runs that is not JSON or not the right shape; a part that is not a rules document | fix the sender |
 | 401 | `unauthorized` | no key, wrong key, revoked key | stop; make a new key in the app |
 | 402 | `inactive` | the subscription on this site has ended | stop |
@@ -371,7 +371,7 @@ last chunk, the proof (`422`).
 | Requests | 300 per key in a fixed 10-minute window, every request with the right key counted, refused ones too (`429 rate-limited`) |
 | Rules pushes that build | Advanced: 5 in a rolling day, files and pushes alike (`429 allowance`) |
 | Usage rules | up to 10,000 a month (what Atlassian lists); Advanced keeps all |
-| Runs | window of at most 31 days; 20,000 rows and 500 errors per push; 35 days kept |
+| Runs | window of at most 31 days; 100,000 rows (20,000 a day) and 500 errors per push; 35 days kept |
 
 ## Versions
 

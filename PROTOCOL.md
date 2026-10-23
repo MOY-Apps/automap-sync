@@ -286,7 +286,12 @@ API token can read; Atlassian can change or close it without notice. So:
 chunk 0 of a push in several chunks clears whatever any run of that kind left staged. Every rule goes, none is
 dropped: Advanced keeps every rule Atlassian lists (10,000 at most). Answers: `202 accepted`
 for a chunk, `202 queued` for the last, `409 conflict` for a chunk out of order, `400
-bad-request` (not usage), `422 checksum`, and the key and rate answers of any push.
+bad-request` (not usage), `422 checksum`, and the key and rate answers of any push. The
+last chunk checks the proof and the shape and queues the write (APPS-514): the text stays
+staged for a `store-usage` job on the app's queue, which writes it within a minute and
+deletes the stage. Chunk 0 of a newer usage push sweeps a stage whose job has not run; that
+job then stores nothing and the newer one does. A month pushed again unchanged rewrites
+no rule, only when it came and from whom.
 
 **Body:**
 
@@ -354,7 +359,11 @@ fields below.
 `hours` is optional and sparse: runs (not edits) per UTC hour of that day, only the hours
 that had any. It is what shows a burst - hundreds of runs inside one hour after a bulk
 edit or an import - which a day's total hides. The window is whole UTC days and at most 31; a push replaces the days it covers and the app
-keeps 35 days back (`src/usage/runs.js`). On Advanced a day leaving the 35 is first added
+keeps 35 days back (`src/usage/runs.js`). A push holds at most 20,000 rows a day and
+100,000 in all (APPS-514); past the whole, the newest days are kept whole, the oldest
+dropped, and the window starts at the first day kept, so the dropped days are not
+replaced - the log says how many went. The write is a `store-runs` job on the queue, as
+for usage: `202 queued` means staged and queued, written within a minute. On Advanced a day leaving the 35 is first added
 to its month (`rule_runs_monthly`), kept 13 months, each day once however often a window is
 pushed again; nothing about the push changes for it, and old senders feed it as they are.
 The card shows a rule's runs over the last 30 days, the failing component in words and,
